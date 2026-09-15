@@ -51,25 +51,58 @@ static LV3_BATCH_COALESCE_US: AtomicU64 = AtomicU64::new(0);
 static LV3_BATCH_TARGET_BYTES: AtomicUsize = AtomicUsize::new(0);
 static LV3_BATCH_EXECUTORS: AtomicUsize = AtomicUsize::new(0);
 static LV3_BATCH_IDLE_DISPATCH: AtomicBool = AtomicBool::new(false);
+/// Floor under `idle_dispatch`. `usize::MAX` = unset, which resolves to
+/// `lv3_batch_target_bytes()`; see [`lv3_batch_min_dispatch_bytes`].
+static LV3_BATCH_MIN_DISPATCH_BYTES: AtomicUsize = AtomicUsize::new(usize::MAX);
 
-/// Override the LV3 aggregation window / byte target / executor count. `0`
-/// keeps the compiled default for each. Applies to subsequently started
-/// engines.
+/// Override the LV3 aggregation window / byte target / executor count / idle
+/// dispatch floor. `0` keeps the compiled default for each (`min_dispatch_bytes`
+/// uses `0` for "derive it from the byte target").
 ///
 /// The window and the executor count interact: shortening the window raises
 /// batch frequency (measured 5x at 200 us), at which point `exec_queue` --
 /// waiting for one of the fixed executors -- becomes the largest non-device
 /// term. They have to be swept together, hence one entry point.
+///
+/// `coalesce_us`, `target_bytes` and `min_dispatch_bytes` are re-read on every
+/// batch, so they take effect in a RUNNING engine; `executors` sizes the thread
+/// pool at start and does not. That split is deliberate — an arm-per-restart A/B
+/// on this box measures run-order drift and pool age rather than the knob, so
+/// everything that CAN be live has to be.
 pub fn set_lv3_batch_tuning(
     coalesce_us: u64,
     target_bytes: usize,
     executors: usize,
     idle_dispatch: bool,
+    min_dispatch_bytes: usize,
 ) {
     LV3_BATCH_COALESCE_US.store(coalesce_us, Ordering::Relaxed);
     LV3_BATCH_TARGET_BYTES.store(target_bytes, Ordering::Relaxed);
     LV3_BATCH_EXECUTORS.store(executors, Ordering::Relaxed);
     LV3_BATCH_IDLE_DISPATCH.store(idle_dispatch, Ordering::Relaxed);
+    LV3_BATCH_MIN_DISPATCH_BYTES.store(
+        if min_dispatch_bytes == 0 {
+            usize::MAX
+        } else {
+            min_dispatch_bytes
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// Read back the live aggregation limits as
+/// `(coalesce_us, target_bytes, executors, idle_dispatch, min_dispatch_bytes)`,
+/// resolved to the values the aggregator will actually use. The IPC handler
+/// echoes this so an A/B arm can prove the knob reached the batcher instead of
+/// assuming it did (same rule as chunklet's `lv2_lock_group_shift` override).
+pub fn lv3_batch_tuning() -> (u64, usize, usize, bool, usize) {
+    (
+        lv3_batch_coalesce().as_micros() as u64,
+        lv3_batch_target_bytes(),
+        lv3_batch_executors(),
+        lv3_batch_idle_dispatch(),
+        lv3_batch_min_dispatch_bytes(),
+    )
 }
 
 /// See [`crate::config::StorageConfig::lv3_batch_idle_dispatch`] for why this is
@@ -95,6 +128,34 @@ fn lv3_batch_executors() -> usize {
 fn lv3_batch_target_bytes() -> usize {
     match LV3_BATCH_TARGET_BYTES.load(Ordering::Relaxed) {
         0 => CHUNKLET_BATCH_TARGET_BYTES,
+        bytes => bytes,
+    }
+}
+
+/// Smallest batch `idle_dispatch` may release early. Unset (`usize::MAX`)
+/// resolves to HALF the byte target, i.e. "half a full-size device call is
+/// enough to go now when a device slot is free".
+///
+/// ⚠ It deliberately does NOT resolve to the byte target itself. The chunk split
+/// cuts at "adding the next write would exceed the target", so a producer's
+/// chunks are each just *under* it (42 x 24 KiB = 1008 KiB against a 1 MiB
+/// target) and a floor of exactly `target_bytes` is therefore unreachable —
+/// early dispatch would silently never fire.
+///
+/// This floor is the difference between the shipped `idle_dispatch` and a usable
+/// one. Box 2026-08-14 measured the zero-floor version winning every metric it
+/// targeted (window 1.43 -> 0.00 ms/request, producer wait 16x, device
+/// concurrency 0.97 -> 1.35) and losing 1007 -> 771 MiB/s end to end, because
+/// releasing a batch the instant an executor frees up also shortened the WRITER
+/// lane's cycle: chunklet 68.4 -> 2.4 stripes/call, adjacency merge 2.93 ->
+/// 1.05x, metadb commits 583 -> 2949/s. Concurrency is worth 6x and call size
+/// only +27% ([`OutstandingBatches`]), so the right shape is "dispatch early,
+/// but never below one whole device call" — which needs the floor AND a writer
+/// batch target that does not shrink with the call (see
+/// `flush.writer_batch_target_units`).
+fn lv3_batch_min_dispatch_bytes() -> usize {
+    match LV3_BATCH_MIN_DISPATCH_BYTES.load(Ordering::Relaxed) {
+        usize::MAX => lv3_batch_target_bytes() / 2,
         bytes => bytes,
     }
 }
@@ -313,7 +374,6 @@ impl ChunkletWriteBatcher {
         outstanding: OutstandingBatches,
         executors: usize,
     ) {
-        let idle_dispatch_enabled = lv3_batch_idle_dispatch();
         while let Ok(mut first) = request_rx.recv() {
             first.picked_at = Some(Instant::now());
             let mut byte_count: usize = first.ops.iter().map(|op| op.len).sum();
@@ -321,8 +381,34 @@ impl ChunkletWriteBatcher {
             let mut idle_dispatch = false;
             let deadline = std::time::Instant::now() + lv3_batch_coalesce();
             let target_bytes = lv3_batch_target_bytes();
+            // Re-read per batch (not once per loop) so an IPC flip takes effect
+            // in a running engine — the only valid A/B shape on the perf box.
+            let idle_dispatch_enabled = lv3_batch_idle_dispatch();
+            let min_dispatch_bytes = lv3_batch_min_dispatch_bytes();
             loop {
                 if byte_count >= target_bytes {
+                    break;
+                }
+                // A batch that is ALREADY a whole device call must not absorb
+                // another producer's request while a device slot sits free —
+                // that request would otherwise have been a second concurrent
+                // call, and concurrency is worth 6x where call size is worth
+                // +27% (see `OutstandingBatches`).
+                //
+                // ⚠ This has to be tested BEFORE `try_recv`, not only on its
+                // `Empty` branch. The chunk split cuts at "adding the next write
+                // would exceed the target", so a producer's chunks are each just
+                // UNDER the target and its siblings are already sitting in
+                // `request_rx` — the absorb-then-continue path therefore reached
+                // the target by pairing two chunks and never consulted the floor
+                // at all. Box 2026-09-14: requests/batch stayed at 1.94-2.26
+                // across nine segments with the floor on the `Empty` branch
+                // only, i.e. exactly half the available concurrency.
+                if idle_dispatch_enabled
+                    && byte_count >= min_dispatch_bytes
+                    && outstanding.load(Ordering::Acquire) < executors
+                {
+                    idle_dispatch = true;
                     break;
                 }
                 match request_rx.try_recv() {
@@ -335,17 +421,13 @@ impl ChunkletWriteBatcher {
                     Err(crossbeam_channel::TryRecvError::Disconnected) => break,
                     Err(crossbeam_channel::TryRecvError::Empty) => {}
                 }
-                // Nothing queued right now. Waiting for company is only free
-                // when every executor is already busy — then this batch would
-                // sit in `work_tx` anyway, so growing it is pure gain. With an
-                // executor idle the wait instead leaves a device slot empty for
-                // up to `lv3_batch_coalesce()` AND folds the next arriving
-                // writer lane into this call instead of letting it be a second
-                // concurrent one. See `OutstandingBatches`.
-                if idle_dispatch_enabled && outstanding.load(Ordering::Acquire) < executors {
-                    idle_dispatch = true;
-                    break;
-                }
+                // Nothing queued right now, and the top-of-loop test already
+                // decided this batch is below `min_dispatch_bytes` — so it is
+                // not yet a whole device call and waiting for company is the
+                // right trade. Below the floor, "go now" would hand the device a
+                // fragment and, through the writer's try_recv-empty drain, shrink
+                // the producer's next cycle to match. See
+                // `lv3_batch_min_dispatch_bytes`.
                 let now = std::time::Instant::now();
                 if now >= deadline {
                     break;
@@ -1266,6 +1348,20 @@ impl IoEngine {
         }
 
         let write_count = writes.len();
+        // Split at the LIVE byte target, not the compiled constant. The
+        // aggregator's dispatch test is `byte_count >= lv3_batch_target_bytes()`,
+        // so a chunk cut at a larger size is always a target hit on its own and
+        // the knob has no reachable downward range at all — which is why
+        // shrinking it had never been tried.
+        //
+        // ⭐ This is also the cheapest concurrency lever in the write path.
+        // `submit_many` below sends EVERY chunk before waiting on any of them,
+        // so one 4 MiB lane batch at a 1 MiB target becomes four independent
+        // requests sitting in `request_rx` at once: each hits the target
+        // immediately and dispatches to its own executor. That buys device
+        // concurrency WITHOUT shrinking the writer's batch, which is the half
+        // the zero-floor `idle_dispatch` was missing.
+        let chunk_target_bytes = lv3_batch_target_bytes();
         let mut meta_chunks = Vec::new();
         let mut request_chunks = Vec::new();
         let mut metas = Vec::new();
@@ -1289,8 +1385,7 @@ impl IoEngine {
                     "chunklet owned write batch is too large",
                 ))
             })?;
-            if !slabs.is_empty() && chunk_bytes.saturating_add(total) > CHUNKLET_BATCH_TARGET_BYTES
-            {
+            if !slabs.is_empty() && chunk_bytes.saturating_add(total) > chunk_target_bytes {
                 meta_chunks.push(std::mem::take(&mut metas));
                 request_chunks.push((std::mem::take(&mut slabs), std::mem::take(&mut ops)));
                 chunk_bytes = 0;

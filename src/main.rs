@@ -167,6 +167,41 @@ enum Command {
         /// New cap in whole stripes; omit to just read the current one.
         stripes: Option<u32>,
     },
+    /// Read or set the LV3 aggregation byte target and its early-dispatch floor.
+    ///
+    /// `target_bytes` cuts a writer request into chunks AND ends an aggregation
+    /// window, and all chunks of one request are submitted before any is waited
+    /// on — so lowering it converts one lane's batch into several independent
+    /// device calls. That is the device-CONCURRENCY lever (box: 0.85 calls in
+    /// flight against six executors, while the same LD does 1738 MiB/s at 6
+    /// concurrent callers). `min_dispatch_bytes` (`0` = derive from
+    /// `target_bytes`) is the floor that keeps early dispatch from handing the
+    /// device a fragment. Runtime-settable so the A/B stays inside ONE process.
+    LV3Batch {
+        /// Aggregation byte target; `0` keeps the compiled default (4 MiB).
+        target_bytes: Option<usize>,
+        /// Early-dispatch floor in bytes; `0` derives it from `target_bytes`.
+        min_dispatch_bytes: Option<usize>,
+        /// Aggregation window in microseconds; omit to leave it alone.
+        coalesce_us: Option<u64>,
+    },
+    /// Read or set the writer lane's batch accumulation targets
+    /// (`flush.writer_read_active_batch_*`).
+    ///
+    /// The read-active pair is the one a mixed workload runs on — `read_active`
+    /// is derived from the GLOBAL read counter, so every lane is read-active on
+    /// essentially every cycle and its 32-unit target makes each LV3 request
+    /// 128 KiB. Check `flush_writer_batch: read_active_cycles / cycles` first.
+    /// Raise the deadline with the target or the lane just times out at the old
+    /// size. Runtime-settable so the A/B stays inside ONE process.
+    WriterBatch {
+        /// Read-active unit target; `0` keeps the compiled default (32).
+        target_units: Option<usize>,
+        /// Read-active drain deadline in microseconds; `0` keeps the default (250).
+        coalesce_us: Option<u64>,
+        /// Extra byte floor before the unit target may end the drain; `0` = off.
+        target_bytes: Option<usize>,
+    },
     /// Read or flip the width-biased stripe-reserve refill
     /// (`storage.stripe_refill_width_bias`).
     ///
@@ -1246,6 +1281,60 @@ fn main() -> anyhow::Result<()> {
             let cmd = match stripes {
                 Some(n) => format!("stripe-run {n}"),
                 None => "stripe-run".to_string(),
+            };
+            for line in service::send_chunklet_command(sock, &cmd)? {
+                println!("{line}");
+            }
+        }
+        Command::LV3Batch {
+            target_bytes,
+            min_dispatch_bytes,
+            coalesce_us,
+        } => {
+            let sock = &config.service.socket_path;
+            if !sock.exists() {
+                anyhow::bail!(
+                    "lv3-batch talks to a running engine (socket {:?} not found) — \
+                     start it first, or set [storage].lv3_batch_target_bytes / \
+                     lv3_batch_min_dispatch_bytes in its config",
+                    sock
+                );
+            }
+            let cmd = match (target_bytes, min_dispatch_bytes, coalesce_us) {
+                (Some(target), floor, window) => {
+                    let mut cmd = format!("lv3-batch {target} {}", floor.unwrap_or(0));
+                    if let Some(us) = window {
+                        cmd.push_str(&format!(" {us}"));
+                    }
+                    cmd
+                }
+                (None, _, _) => "lv3-batch".to_string(),
+            };
+            for line in service::send_chunklet_command(sock, &cmd)? {
+                println!("{line}");
+            }
+        }
+        Command::WriterBatch {
+            target_units,
+            coalesce_us,
+            target_bytes,
+        } => {
+            let sock = &config.service.socket_path;
+            if !sock.exists() {
+                anyhow::bail!(
+                    "writer-batch talks to a running engine (socket {:?} not found) — \
+                     start it first, or set [flush].writer_read_active_batch_target_units \
+                     in its config",
+                    sock
+                );
+            }
+            let cmd = match target_units {
+                Some(units) => format!(
+                    "writer-batch {units} {} {}",
+                    coalesce_us.unwrap_or(0),
+                    target_bytes.unwrap_or(0)
+                ),
+                None => "writer-batch".to_string(),
             };
             for line in service::send_chunklet_command(sock, &cmd)? {
                 println!("{line}");

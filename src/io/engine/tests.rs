@@ -185,6 +185,7 @@ impl crate::io::block_backend::BlockBackend for BatchMock {
 }
 
 #[test]
+#[serial_test::serial]
 fn chunklet_batch_uses_one_write_many_slab_and_records_depth() {
     let backend = Arc::new(BatchMock {
         write_many_calls: std::sync::atomic::AtomicUsize::new(0),
@@ -224,6 +225,7 @@ fn chunklet_batch_uses_one_write_many_slab_and_records_depth() {
 }
 
 #[test]
+#[serial_test::serial]
 fn chunklet_owned_batch_writes_aligned_buffers_without_repacking() {
     let backend = Arc::new(BatchMock {
         write_many_calls: std::sync::atomic::AtomicUsize::new(0),
@@ -258,10 +260,13 @@ fn chunklet_owned_batch_writes_aligned_buffers_without_repacking() {
 /// must NOT pay the coalesce window for that: waiting for company is only free
 /// when the device is saturated. The producer's blocked wait must still be split
 /// across pickup / window / exec_queue rather than all landing on device time.
+///
+/// The 1-byte `min_dispatch_bytes` is what makes this the zero-floor behaviour;
+/// `lv3_batch_holds_the_window_below_the_idle_dispatch_floor` covers the default.
 #[test]
 #[serial_test::serial]
 fn lv3_batch_skips_the_window_when_an_executor_is_idle() {
-    set_lv3_batch_tuning(0, 0, 0, true);
+    set_lv3_batch_tuning(0, 0, 0, true, 1);
     let _restore = ResetLv3Tuning;
     let backend = Arc::new(BatchMock {
         write_many_calls: std::sync::atomic::AtomicUsize::new(0),
@@ -369,7 +374,7 @@ impl crate::io::block_backend::BlockBackend for GatedBatchMock {
 #[test]
 #[serial_test::serial]
 fn lv3_batch_coalesces_again_once_every_executor_is_busy() {
-    set_lv3_batch_tuning(2_000, 0, 1, true);
+    set_lv3_batch_tuning(2_000, 0, 1, true, 1);
     let restore = ResetLv3Tuning;
     let backend = Arc::new(GatedBatchMock {
         released: std::sync::atomic::AtomicBool::new(false),
@@ -421,13 +426,146 @@ fn lv3_batch_coalesces_again_once_every_executor_is_busy() {
     drop(restore);
 }
 
+/// The floor that separates a usable early dispatch from the 2026-08-14
+/// regression. With `idle_dispatch` armed and every executor idle, a batch that
+/// is still well under `min_dispatch_bytes` must keep waiting — otherwise the
+/// device gets a fragment and the producer's next cycle shrinks to match.
+#[test]
+#[serial_test::serial]
+fn lv3_batch_holds_the_window_below_the_idle_dispatch_floor() {
+    // Short window so the fallback timeout is quick; floor far above the batch.
+    set_lv3_batch_tuning(2_000, 0, 0, true, 1 << 20);
+    let _restore = ResetLv3Tuning;
+    let backend = Arc::new(BatchMock {
+        write_many_calls: std::sync::atomic::AtomicUsize::new(0),
+        write_many_ops: std::sync::atomic::AtomicUsize::new(0),
+        write_many_max_ops: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let metrics = Arc::new(EngineMetrics::default());
+    let engine = IoEngine::new_chunklet(backend.clone(), false, metrics.clone());
+    let mut buffer = engine.allocate_owned_write_buffer(4096, None).unwrap();
+    buffer.as_mut_slice().fill(0x11);
+    engine
+        .submit_owned_write_batch_on(
+            None,
+            vec![OwnedLvWrite {
+                pba: Pba(0),
+                payload_len: 4096,
+                buffer,
+            }],
+            false,
+        )
+        .unwrap();
+
+    // It still got written — it just left on the window, not on the floor.
+    assert_eq!(backend.write_many_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(metrics.lv3_batch_idle_dispatches.load(Ordering::Relaxed), 0);
+    assert_eq!(metrics.lv3_batch_window_timeouts.load(Ordering::Relaxed), 1);
+}
+
+/// The chunk split must follow the LIVE byte target, not the compiled constant.
+/// Before this was fixed the two disagreed, so every chunk was larger than the
+/// dispatch target and no value below 4 MiB had any reachable effect.
+///
+/// This is the device-concurrency mechanism in miniature: ONE producer call
+/// becomes two independent requests that each hit the target on their own and
+/// dispatch as their own device call, while the producer's batch is unchanged.
+#[test]
+#[serial_test::serial]
+fn lv3_batch_chunks_and_dispatches_at_the_live_byte_target() {
+    set_lv3_batch_tuning(2_000, 8192, 0, false, 0);
+    let _restore = ResetLv3Tuning;
+    let backend = Arc::new(BatchMock {
+        write_many_calls: std::sync::atomic::AtomicUsize::new(0),
+        write_many_ops: std::sync::atomic::AtomicUsize::new(0),
+        write_many_max_ops: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let metrics = Arc::new(EngineMetrics::default());
+    let engine = IoEngine::new_chunklet(backend.clone(), false, metrics.clone());
+    let mut writes = Vec::new();
+    for idx in 0..4 {
+        let mut buffer = engine.allocate_owned_write_buffer(4096, None).unwrap();
+        buffer.as_mut_slice().fill((idx + 1) as u8);
+        writes.push(OwnedLvWrite {
+            pba: Pba(idx),
+            payload_len: 4096,
+            buffer,
+        });
+    }
+    engine
+        .submit_owned_write_batch_on(None, writes, false)
+        .unwrap();
+
+    // One producer call...
+    assert_eq!(metrics.lv3_batch_wait_calls.load(Ordering::Relaxed), 1);
+    // ...cut into two 8 KiB requests...
+    assert_eq!(metrics.lv3_batch_requests.load(Ordering::Relaxed), 2);
+    // ...each of which is a target hit on its own, so each is its own call.
+    assert_eq!(metrics.lv3_batch_target_hits.load(Ordering::Relaxed), 2);
+    assert_eq!(metrics.lv3_batch_window_timeouts.load(Ordering::Relaxed), 0);
+    assert_eq!(backend.write_many_calls.load(Ordering::Relaxed), 2);
+    assert_eq!(backend.write_many_ops.load(Ordering::Relaxed), 4);
+    assert_eq!(
+        metrics.lv3_batch_bytes_at_dispatch.load(Ordering::Relaxed),
+        16384
+    );
+}
+
+/// Regression for the defect the 2026-09-14 box run exposed: the floor has to be
+/// consulted BEFORE `try_recv`, not only on its `Empty` branch.
+///
+/// `submit_many` queues every chunk of one producer request before waiting on
+/// any, so a sibling chunk is ALWAYS already sitting in `request_rx`. With the
+/// floor tested only on `Empty`, the aggregator absorbed that sibling, reached
+/// the byte target by pairing two chunks, and dispatched one batch of two — nine
+/// box segments measured `requests/batch` pinned at 1.94-2.26, i.e. exactly half
+/// the concurrency the split had made available.
+///
+/// Here: target 8 KiB cuts a 16 KiB request into two 8 KiB chunks, floor 4 KiB.
+/// Each chunk must leave on its own.
+#[test]
+#[serial_test::serial]
+fn lv3_batch_floor_dispatches_before_absorbing_a_queued_sibling() {
+    set_lv3_batch_tuning(2_000, 8192, 0, true, 4096);
+    let _restore = ResetLv3Tuning;
+    let backend = Arc::new(BatchMock {
+        write_many_calls: std::sync::atomic::AtomicUsize::new(0),
+        write_many_ops: std::sync::atomic::AtomicUsize::new(0),
+        write_many_max_ops: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let metrics = Arc::new(EngineMetrics::default());
+    let engine = IoEngine::new_chunklet(backend.clone(), false, metrics.clone());
+    let mut writes = Vec::new();
+    for idx in 0..4 {
+        let mut buffer = engine.allocate_owned_write_buffer(4096, None).unwrap();
+        buffer.as_mut_slice().fill((idx + 1) as u8);
+        writes.push(OwnedLvWrite {
+            pba: Pba(idx),
+            payload_len: 4096,
+            buffer,
+        });
+    }
+    engine
+        .submit_owned_write_batch_on(None, writes, false)
+        .unwrap();
+
+    // Two chunks, and each one is its OWN batch — not one batch of two.
+    assert_eq!(metrics.lv3_batch_requests.load(Ordering::Relaxed), 2);
+    assert_eq!(backend.write_many_calls.load(Ordering::Relaxed), 2);
+    let batches = metrics.lv3_batch_target_hits.load(Ordering::Relaxed)
+        + metrics.lv3_batch_idle_dispatches.load(Ordering::Relaxed)
+        + metrics.lv3_batch_window_timeouts.load(Ordering::Relaxed);
+    assert_eq!(batches, 2, "one request per batch");
+    assert_eq!(metrics.lv3_batch_window_timeouts.load(Ordering::Relaxed), 0);
+}
+
 /// Puts the global LV3 tuning back on its compiled defaults even if the test
 /// panics, so a `#[serial]` failure cannot leak into the next test.
 struct ResetLv3Tuning;
 
 impl Drop for ResetLv3Tuning {
     fn drop(&mut self) {
-        set_lv3_batch_tuning(0, 0, 0, false);
+        set_lv3_batch_tuning(0, 0, 0, false, 0);
     }
 }
 
@@ -443,6 +581,7 @@ fn wait_for(mut predicate: impl FnMut() -> bool, what: &str) {
 }
 
 #[test]
+#[serial_test::serial]
 fn chunklet_owned_batch_splits_oversized_request_across_executors() {
     const WRITE_COUNT: u64 = CHUNKLET_BATCH_TARGET_BYTES as u64 / BLOCK_SIZE as u64 + 1;
     let backend = Arc::new(BatchMock {
@@ -484,6 +623,7 @@ fn chunklet_owned_batch_splits_oversized_request_across_executors() {
 }
 
 #[test]
+#[serial_test::serial]
 fn chunklet_batcher_combines_concurrent_callers() {
     let backend = Arc::new(BatchMock {
         write_many_calls: std::sync::atomic::AtomicUsize::new(0),

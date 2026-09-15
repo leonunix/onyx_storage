@@ -1081,6 +1081,19 @@ pub struct StorageConfig {
     pub lv3_batch_coalesce_us: u64,
     /// Byte target that ends an LV3 aggregation window early. `0` keeps the
     /// compiled default (4 MiB = two RAID6 full stripes).
+    ///
+    /// ⭐ This also cuts the writer's request into chunks (one `submit_many` call
+    /// sends every chunk before waiting on any), so it doubles as the device
+    /// CONCURRENCY knob: a 4 MiB lane batch at a 1 MiB target arrives as four
+    /// independent requests that each hit the target on their own and dispatch to
+    /// four executors, while the writer's batch — and therefore the metadb commit
+    /// size — is untouched. Before 2026-09-14 the chunk split used the compiled
+    /// constant while dispatch used this knob, so values below 4 MiB had no
+    /// reachable effect and were never A/B'd.
+    ///
+    /// Judge it on `lv3_batch` requests/batch and `flush_delta.py`'s `device
+    /// concurrency` (0.85 measured at 250 MB/s), then check `chunklet_submit_*`
+    /// sqes/byte did not rise and metadb commits/s did not.
     #[serde(default)]
     pub lv3_batch_target_bytes: usize,
     /// Number of LV3 batch executor threads (each owns one chunklet io_uring).
@@ -1115,6 +1128,22 @@ pub struct StorageConfig {
     /// `flush_writer_ns.meta_commit` — never on latency alone.
     #[serde(default)]
     pub lv3_batch_idle_dispatch: bool,
+    /// Smallest batch `lv3_batch_idle_dispatch` may release early, in bytes.
+    /// `0` derives it as HALF of `lv3_batch_target_bytes` — "half a full device
+    /// call is enough to go now when a device slot is free". It is deliberately
+    /// not the target itself: the chunk split cuts at "adding the next write
+    /// would exceed the target", so chunks land just under it and a floor of
+    /// exactly the target can never be reached.
+    ///
+    /// This is the floor the 2026-08-14 `idle_dispatch` arm lacked. Without it
+    /// the aggregator releases whatever it holds the instant an executor frees
+    /// up — which buys concurrency but hands the device a fragment and, through
+    /// the writer's `try_recv`-empty drain loop, shrinks the producer's next
+    /// batch to match. With it, early dispatch can only ever convert an
+    /// already-full call from "wait for a second lane" into "go now", so
+    /// concurrency rises and the work quantum does not fall.
+    #[serde(default)]
+    pub lv3_batch_min_dispatch_bytes: usize,
     /// RAID-aware full-stripe writes (roadmap ③). When true, the flush writer
     /// allocates + zero-pads each LV3 passthrough write to a whole RAID stripe
     /// (`full_stripe_bytes` from the chunklet LD geometry) so a RAID5/6 backend
@@ -1255,6 +1284,7 @@ impl Default for StorageConfig {
             lv3_batch_target_bytes: 0,
             lv3_batch_executors: 0,
             lv3_batch_idle_dispatch: false,
+            lv3_batch_min_dispatch_bytes: 0,
             raid_full_stripe_writes: default_raid_full_stripe_writes(),
             stripe_group_lifetime_affinity: false,
             allocator_regions: default_allocator_regions(),
@@ -2229,8 +2259,39 @@ pub struct FlushConfig {
     /// Maximum units a writer lane drains per cycle while foreground reads
     /// are active. Lower values protect read tail latency; higher values
     /// improve backend drain when the write queue is saturated.
+    ///
+    /// ⚠ This has equalled `flush.writer_batch_size` (1024) since 2026-05, so
+    /// the read-active path currently caps NOTHING. What actually differs is
+    /// `writer_read_active_batch_target_units` below.
     #[serde(default = "default_writer_read_active_batch_size")]
     pub writer_read_active_batch_size: usize,
+    /// Units a writer lane accumulates before it stops waiting, while foreground
+    /// reads are active. `0` keeps the compiled default (32).
+    ///
+    /// ⚠ `read_active` is computed from the GLOBAL read counter, so under any
+    /// mixed workload this — not the 512 idle target — is the steady-state batch
+    /// target for every lane. 32 units is a 128 KiB LV3 request, which is too
+    /// small to stand alone as a device call, so the aggregator folds ~9 lanes
+    /// into one batch and device concurrency lands at ~0.9. Confirm the premise
+    /// with `flush_writer_batch: read_active_cycles / cycles` before tuning.
+    /// Runtime-settable via the `writer-batch` IPC/CLI command.
+    #[serde(default)]
+    pub writer_read_active_batch_target_units: usize,
+    /// Drain deadline for a read-active writer cycle, microseconds. `0` keeps the
+    /// compiled default (250). Raising the target units without raising this does
+    /// nothing — the lane just times out at the old size.
+    #[serde(default)]
+    pub writer_read_active_batch_coalesce_us: u64,
+    /// Additional byte floor a writer lane batch must clear before its unit
+    /// target may end the drain. `0` = off (unit target alone decides).
+    ///
+    /// Units are 4 KiB up to `coalesce_max_raw_bytes` and compression shrinks
+    /// them, so a unit count alone lets the LV3 request size drift with the
+    /// compression ratio. Set this when an arm needs a stable request size —
+    /// e.g. to keep every lane request at or above
+    /// `storage.lv3_batch_target_bytes` so it dispatches as its own device call.
+    #[serde(default)]
+    pub writer_batch_target_bytes: usize,
     /// Enable the per-volume commit_worker pipeline. When enabled, a
     /// worker can issue up to `commit_worker_pipeline_depth` metadb
     /// `atomic_batch_write_multi_with_dedup_deferred` calls before
@@ -2353,6 +2414,9 @@ impl Default for FlushConfig {
             commit_coalesce_timeout_us: default_commit_coalesce_timeout_us(),
             packed_commit_try_drain_lba_budget: default_packed_commit_try_drain_lba_budget(),
             writer_read_active_batch_size: default_writer_read_active_batch_size(),
+            writer_read_active_batch_target_units: 0,
+            writer_read_active_batch_coalesce_us: 0,
+            writer_batch_target_bytes: 0,
             commit_worker_deferred_outcomes: default_commit_worker_deferred_outcomes(),
             commit_worker_pipeline_depth: default_commit_worker_pipeline_depth(),
         }
@@ -2878,6 +2942,82 @@ mod service_config_tests {
         // Unset knobs must stay on the compiled default rather than zeroing the
         // byte target, which would make every batch dispatch immediately.
         assert_eq!(configured.storage.lv3_batch_target_bytes, 0);
+    }
+
+    /// The concurrency pair: a smaller byte target cuts one producer request into
+    /// several independent device calls, and the floor keeps early dispatch from
+    /// releasing a fragment. `0` on the floor must mean "derive from the target",
+    /// not "no floor" — that difference is the whole 2026-08-14 regression.
+    #[test]
+    #[serial_test::serial]
+    fn lv3_batch_min_dispatch_floor_defaults_to_the_byte_target() {
+        let default_config: OnyxConfig = toml::from_str("").unwrap();
+        assert_eq!(default_config.storage.lv3_batch_min_dispatch_bytes, 0);
+
+        let configured: OnyxConfig = toml::from_str(
+            r#"
+                [storage]
+                lv3_batch_target_bytes = 1048576
+                lv3_batch_min_dispatch_bytes = 1048576
+                lv3_batch_idle_dispatch = true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(configured.storage.lv3_batch_target_bytes, 1_048_576);
+        assert_eq!(configured.storage.lv3_batch_min_dispatch_bytes, 1_048_576);
+
+        use crate::io::engine::{lv3_batch_tuning, set_lv3_batch_tuning};
+        let (coalesce, target, executors, idle, _) = lv3_batch_tuning();
+        // `0` derives the floor as HALF the byte target — a chunk lands just
+        // under the target, so a floor equal to it would be unreachable.
+        set_lv3_batch_tuning(0, 1_048_576, 0, true, 0);
+        assert_eq!(lv3_batch_tuning().4, 524_288);
+        // An explicit floor wins over the derivation.
+        set_lv3_batch_tuning(0, 1_048_576, 0, true, 4096);
+        assert_eq!(lv3_batch_tuning().4, 4096);
+        set_lv3_batch_tuning(coalesce, target, executors, idle, 0);
+    }
+
+    /// The writer lane's read-active targets are what a mixed workload actually
+    /// runs on, so they have to be both configurable and live-settable.
+    #[test]
+    #[serial_test::serial]
+    fn writer_batch_targets_default_to_compiled_values_and_round_trip() {
+        let default_config: OnyxConfig = toml::from_str("").unwrap();
+        assert_eq!(
+            default_config
+                .flush
+                .writer_read_active_batch_target_units,
+            0
+        );
+        assert_eq!(default_config.flush.writer_read_active_batch_coalesce_us, 0);
+        assert_eq!(default_config.flush.writer_batch_target_bytes, 0);
+
+        let configured: OnyxConfig = toml::from_str(
+            r#"
+                [flush]
+                writer_read_active_batch_target_units = 256
+                writer_read_active_batch_coalesce_us = 2000
+                writer_batch_target_bytes = 1048576
+            "#,
+        )
+        .unwrap();
+        assert_eq!(configured.flush.writer_read_active_batch_target_units, 256);
+        assert_eq!(configured.flush.writer_read_active_batch_coalesce_us, 2000);
+        assert_eq!(configured.flush.writer_batch_target_bytes, 1_048_576);
+
+        use crate::buffer::flush::{set_writer_batch_tuning, writer_batch_tuning};
+        let (units, coalesce_us, bytes) = writer_batch_tuning();
+        assert_eq!(
+            set_writer_batch_tuning(0, 0, 0),
+            (32, 250, 0),
+            "0 restores the compiled read-active target and deadline"
+        );
+        assert_eq!(
+            set_writer_batch_tuning(256, 2000, 1_048_576),
+            (256, 2000, 1_048_576)
+        );
+        set_writer_batch_tuning(units, coalesce_us, bytes);
     }
 
     /// Design D's two knobs default OFF — that is what makes the box A/B a

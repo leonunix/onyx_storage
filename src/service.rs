@@ -846,6 +846,147 @@ impl ServiceController {
                     let _ = stream.write_all(msg.as_bytes());
                     let _ = stream.flush();
                 }
+                // Read or set the LV3 device-concurrency pair:
+                //   lv3-batch [<target_bytes> <min_dispatch_bytes> [<coalesce_us>]]
+                //
+                // `target_bytes` both ends an aggregation window early AND cuts a
+                // writer request into chunks, and `submit_many` sends every chunk
+                // before waiting on any of them — so lowering it turns ONE lane's
+                // batch into several independent requests that each dispatch to
+                // their own executor. That is the concurrency lever: the box
+                // measured 0.85 device calls in flight against six executors while
+                // the same LD does 1738 MiB/s at 6 concurrent callers.
+                //
+                // `min_dispatch_bytes` is the floor under `idle_dispatch`. An
+                // explicit value arms early dispatch; `0` derives the floor from
+                // `target_bytes` and disarms it, so `lv3-batch 0 0` restores the
+                // shipped shape exactly. Without a floor, early dispatch hands
+                // the device a fragment and (through the writer's
+                // try_recv-empty drain) shrinks the producer's next batch to
+                // match — that is exactly how the 2026-08-14 zero-floor arm lost
+                // 1007 -> 771 MiB/s.
+                //
+                // ⚠ The executor COUNT is not settable here: it sizes a thread
+                // pool at engine start. Everything that can be live is, because an
+                // arm-per-restart A/B on this box measures pool age.
+                "lv3-batch" => {
+                    if let Some(target) = parts.get(1) {
+                        let min_dispatch = parts.get(2).copied().unwrap_or("0");
+                        let parsed = target.parse::<usize>().and_then(|target_bytes| {
+                            min_dispatch.parse::<usize>().map(|floor| (target_bytes, floor))
+                        });
+                        let coalesce_us = match parts.get(3) {
+                            Some(raw) => match raw.parse::<u64>() {
+                                Ok(us) => Some(us),
+                                Err(_) => {
+                                    let _ = stream.write_all(
+                                        b"error: usage: lv3-batch [<target_bytes> <min_dispatch_bytes> [<coalesce_us>]]\n",
+                                    );
+                                    let _ = stream.flush();
+                                    continue;
+                                }
+                            },
+                            None => None,
+                        };
+                        match parsed {
+                            Ok((target_bytes, min_dispatch_bytes)) => {
+                                let (cur_coalesce, _, executors, _, _) =
+                                    crate::io::engine::lv3_batch_tuning();
+                                crate::io::engine::set_lv3_batch_tuning(
+                                    coalesce_us.unwrap_or(cur_coalesce),
+                                    target_bytes,
+                                    executors,
+                                    // A floor is only meaningful with early
+                                    // dispatch, so an explicit floor arms it and
+                                    // `0` disarms it. That makes `lv3-batch 0 0`
+                                    // restore the shipped shape exactly, which a
+                                    // bracketing baseline arm depends on.
+                                    //
+                                    // Clearing the config's `idle_dispatch` here
+                                    // is behaviourally exact, not a silent
+                                    // override: with `0` the floor DERIVES from
+                                    // the byte target, and a batch at the byte
+                                    // target already left through the target-hit
+                                    // branch — so early dispatch is unreachable
+                                    // either way. Pass `1` for the old
+                                    // zero-floor behaviour.
+                                    min_dispatch_bytes > 0,
+                                    min_dispatch_bytes,
+                                );
+                            }
+                            Err(_) => {
+                                let _ = stream.write_all(
+                                    b"error: usage: lv3-batch [<target_bytes> <min_dispatch_bytes> [<coalesce_us>]]\n",
+                                );
+                                let _ = stream.flush();
+                                continue;
+                            }
+                        }
+                    }
+                    let (coalesce_us, target_bytes, executors, idle, min_dispatch_bytes) =
+                        crate::io::engine::lv3_batch_tuning();
+                    tracing::info!(
+                        coalesce_us,
+                        target_bytes,
+                        executors,
+                        idle_dispatch = idle,
+                        min_dispatch_bytes,
+                        "LV3 batch tuning"
+                    );
+                    let msg = format!(
+                        "target_bytes={target_bytes} min_dispatch_bytes={min_dispatch_bytes} coalesce_us={coalesce_us} idle_dispatch={idle} executors={executors}\nok\n"
+                    );
+                    let _ = stream.write_all(msg.as_bytes());
+                    let _ = stream.flush();
+                }
+                // Read or set the writer lane's batch accumulation targets:
+                //   writer-batch [<read_active_target_units> <coalesce_us> [<target_bytes>]]
+                //
+                // The read-active pair is what a mixed workload actually runs on:
+                // `read_active` comes from the GLOBAL read counter, so every lane
+                // is read-active on essentially every cycle, and its 32-unit
+                // target makes each LV3 request 128 KiB. Confirm with
+                // `flush_writer_batch: read_active_cycles / cycles` before tuning.
+                //
+                // Pair a raised target with a raised deadline or the lane just
+                // times out at the old size, and watch metadb commits/s: a bigger
+                // lane batch should LOWER them.
+                "writer-batch" => {
+                    if let Some(units) = parts.get(1) {
+                        let coalesce = parts.get(2).copied().unwrap_or("0");
+                        let target_bytes = parts.get(3).copied().unwrap_or("0");
+                        let parsed = units.parse::<usize>().ok().and_then(|units| {
+                            let us = coalesce.parse::<u64>().ok()?;
+                            let bytes = target_bytes.parse::<usize>().ok()?;
+                            Some((units, us, bytes))
+                        });
+                        match parsed {
+                            Some((units, us, bytes)) => {
+                                crate::buffer::flush::set_writer_batch_tuning(units, us, bytes);
+                            }
+                            None => {
+                                let _ = stream.write_all(
+                                    b"error: usage: writer-batch [<target_units> <coalesce_us> [<target_bytes>]]\n",
+                                );
+                                let _ = stream.flush();
+                                continue;
+                            }
+                        }
+                    }
+                    let (units, coalesce_us, target_bytes) =
+                        crate::buffer::flush::writer_batch_tuning();
+                    tracing::info!(
+                        read_active_target_units = units,
+                        read_active_coalesce_us = coalesce_us,
+                        batch_target_bytes = target_bytes,
+                        "writer lane batch targets"
+                    );
+                    let msg = format!(
+                        "read_active_target_units={units} read_active_coalesce_us={coalesce_us} batch_target_bytes={target_bytes}\nok\n"
+                    );
+                    let _ = stream.write_all(msg.as_bytes());
+                    let _ = stream.flush();
+                }
                 // Read or flip the width-biased stripe-reserve refill (design D2,
                 // `storage.stripe_refill_width_bias`) — the SUPPLY half of
                 // `stripe-run`: without it a bundle is only as wide as the

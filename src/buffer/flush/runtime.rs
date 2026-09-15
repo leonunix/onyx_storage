@@ -197,6 +197,21 @@ impl BufferFlusher {
             .writer_read_active_batch_size
             .max(1)
             .min(Self::WRITER_BATCH_SIZE);
+        // Process-global so the `writer-batch` IPC command can flip them in a
+        // running engine; see `writer::set_writer_batch_tuning` for why an
+        // arm-per-restart A/B is not valid on the perf box.
+        let (effective_target_units, effective_coalesce_us, effective_target_bytes) =
+            writer::set_writer_batch_tuning(
+                config.writer_read_active_batch_target_units,
+                config.writer_read_active_batch_coalesce_us,
+                config.writer_batch_target_bytes,
+            );
+        tracing::info!(
+            read_active_target_units = effective_target_units,
+            read_active_coalesce_us = effective_coalesce_us,
+            batch_target_bytes = effective_target_bytes,
+            "flusher: writer lane batch targets"
+        );
         let commit_target_lbas_per_tx = config.commit_target_lbas_per_tx.max(1);
         let commit_coalesce_lba_budget = config.commit_coalesce_lba_budget;
         let commit_retain_tail = config.commit_retain_tail;

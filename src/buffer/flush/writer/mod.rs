@@ -66,6 +66,64 @@ pub fn set_stripe_run_max_stripes(stripes: u32) -> u32 {
 /// i.e. 64 consecutive stripes.
 pub const MAX_STRIPE_RUN_STRIPES: u32 = 64;
 
+/// How much a writer lane accumulates before it stops waiting, when foreground
+/// reads are flowing. `0` = the compiled
+/// [`BufferFlusher::WRITER_READ_ACTIVE_BATCH_TARGET_UNITS`].
+static WRITER_READ_ACTIVE_TARGET_UNITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// Read-active drain deadline in microseconds. `0` = the compiled
+/// [`BufferFlusher::WRITER_READ_ACTIVE_BATCH_COALESCE`].
+static WRITER_READ_ACTIVE_COALESCE_US: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Additional BYTE floor a lane batch must clear before the unit target is
+/// allowed to end the drain. `0` = off (unit target alone decides).
+static WRITER_BATCH_TARGET_BYTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Set the writer-lane batch accumulation targets. `0` restores the compiled
+/// default for each. Returns the effective `(target_units, coalesce_us,
+/// target_bytes)` so a caller — the IPC handler in particular — can prove the
+/// value reached the writer instead of assuming it did.
+///
+/// Process-global and re-read every cycle rather than captured at start, for the
+/// same reason as [`stripe_run_max_stripes`]: on the perf box an arm-per-restart
+/// A/B measures run-order drift and pool age, not the knob, so the only
+/// trustworthy comparison alternates inside ONE process at ONE pool age. Safe
+/// mid-run — it only changes how the NEXT cycle sizes its drain.
+pub fn set_writer_batch_tuning(
+    target_units: usize,
+    coalesce_us: u64,
+    target_bytes: usize,
+) -> (usize, u64, usize) {
+    WRITER_READ_ACTIVE_TARGET_UNITS.store(target_units, std::sync::atomic::Ordering::Relaxed);
+    WRITER_READ_ACTIVE_COALESCE_US.store(coalesce_us, std::sync::atomic::Ordering::Relaxed);
+    WRITER_BATCH_TARGET_BYTES.store(target_bytes, std::sync::atomic::Ordering::Relaxed);
+    writer_batch_tuning()
+}
+
+/// Effective `(read_active_target_units, read_active_coalesce_us, target_bytes)`.
+pub fn writer_batch_tuning() -> (usize, u64, usize) {
+    (
+        writer_read_active_batch_target_units(),
+        BufferFlusher::writer_read_active_batch_coalesce().as_micros() as u64,
+        writer_batch_target_bytes(),
+    )
+}
+
+/// Units a read-active writer cycle accumulates before it stops waiting.
+pub fn writer_read_active_batch_target_units() -> usize {
+    match WRITER_READ_ACTIVE_TARGET_UNITS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => BufferFlusher::WRITER_READ_ACTIVE_BATCH_TARGET_UNITS,
+        units => units,
+    }
+}
+
+/// Byte floor a lane batch must clear before its unit target may end the drain.
+/// `0` = off.
+pub fn writer_batch_target_bytes() -> usize {
+    WRITER_BATCH_TARGET_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl BufferFlusher {
     /// Maximum units a single writer cycle drains from `write_rx` and
     /// folds into one combined metadb commit (packed slots through
@@ -122,8 +180,38 @@ impl BufferFlusher {
     pub(super) const WRITER_PACKED_BATCH_COALESCE: Duration = Duration::from_millis(50);
     /// Foreground reads share LV3 with the flusher. Keep their background
     /// admission window shorter while still avoiding single-digit batches.
+    ///
+    /// ⚠⚠ `read_active` is derived from the GLOBAL `read_submit_calls` counter,
+    /// which any read anywhere in the engine bumps, so under ANY mixed workload
+    /// every writer lane is read-active on essentially every cycle — check
+    /// `flush_writer_batch: read_active_cycles / cycles` before reasoning about
+    /// this path as an exception. It is the steady state, not the exception.
+    ///
+    /// That makes this 32 the effective batch target at 70/30, a 16x drop from
+    /// [`Self::WRITER_BATCH_TARGET_UNITS`], and it is visible downstream: the
+    /// box measured `lv3_batch bytes_at_dispatch / requests` at 128-218 KiB,
+    /// whose lower bound is exactly 32 units x 4 KiB. The aggregator then has to
+    /// fold ~9 lanes to build one usable device call, which is what collapses
+    /// device concurrency to ~0.9.
+    ///
+    /// Note the drain-size half of the protection this pair nominally provides is
+    /// already a no-op: `WRITER_BATCH_SIZE_READ_ACTIVE` was raised to 1024 in
+    /// 2026-05 and now equals [`Self::WRITER_BATCH_SIZE`], so the read-active
+    /// path caps nothing. Foreground reads are separately protected by the
+    /// coalescer's `flush_admission_qos` (`observe_foreground` promotes to
+    /// `QOS_MODE_PROTECTED` on any foreground dispatch). Override both values
+    /// with `flush.writer_read_active_batch_{target_units,coalesce_us}` or the
+    /// `writer-batch` IPC/CLI command.
     pub(super) const WRITER_READ_ACTIVE_BATCH_TARGET_UNITS: usize = 32;
     pub(super) const WRITER_READ_ACTIVE_BATCH_COALESCE: Duration = Duration::from_micros(250);
+
+    /// Read-active drain deadline in force right now.
+    pub(super) fn writer_read_active_batch_coalesce() -> Duration {
+        match WRITER_READ_ACTIVE_COALESCE_US.load(Ordering::Relaxed) {
+            0 => Self::WRITER_READ_ACTIVE_BATCH_COALESCE,
+            us => Duration::from_micros(us),
+        }
+    }
     pub(super) const RETRY_BACKOFF: Duration = Duration::from_secs(1);
     pub(super) const PACKED_SLOT_MAX_AGE: Duration = Duration::from_millis(200);
     pub(super) const PARTIAL_STRIPE_MAX_AGE: Duration = Duration::from_millis(200);
@@ -361,26 +449,36 @@ impl BufferFlusher {
             // the target avoids paying the full coalesce timeout once a useful
             // chunklet batch has formed; under a mature LV2-window burst the
             // no-wait drain keeps going all the way to writer_batch_limit.
+            let mut batch_bytes = first.payload_len();
             let mut incoming = vec![first];
             let batch_target = if read_active {
-                Self::WRITER_READ_ACTIVE_BATCH_TARGET_UNITS
+                writer_read_active_batch_target_units()
             } else {
                 Self::WRITER_BATCH_TARGET_UNITS
             }
             .min(writer_batch_limit);
             let batch_coalesce = if read_active {
-                Self::WRITER_READ_ACTIVE_BATCH_COALESCE
+                Self::writer_read_active_batch_coalesce()
             } else if first_is_packable {
                 Self::WRITER_PACKED_BATCH_COALESCE
             } else {
                 Self::WRITER_BATCH_COALESCE
             };
+            // Optional byte floor on top of the unit target. Units are not a
+            // fixed size (4 KiB up to `coalesce_max_raw_bytes`, and compression
+            // shrinks them), so a unit count alone lets the LV3 request size
+            // drift with the compression ratio. Both targets must be satisfied
+            // before the drain may end early; the deadline still bounds it.
+            let batch_target_bytes = writer_batch_target_bytes();
             let drain_deadline = Instant::now() + batch_coalesce;
             while incoming.len() < writer_batch_limit {
                 match rx.try_recv() {
-                    Ok(unit) => incoming.push(unit),
+                    Ok(unit) => {
+                        batch_bytes += unit.payload_len();
+                        incoming.push(unit);
+                    }
                     Err(_) => {
-                        if incoming.len() >= batch_target {
+                        if incoming.len() >= batch_target && batch_bytes >= batch_target_bytes {
                             break;
                         }
                         let now = Instant::now();
@@ -388,7 +486,10 @@ impl BufferFlusher {
                             break;
                         }
                         match rx.recv_timeout(drain_deadline.saturating_duration_since(now)) {
-                            Ok(unit) => incoming.push(unit),
+                            Ok(unit) => {
+                                batch_bytes += unit.payload_len();
+                                incoming.push(unit);
+                            }
                             Err(_) => break,
                         }
                     }

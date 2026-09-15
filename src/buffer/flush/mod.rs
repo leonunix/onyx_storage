@@ -470,6 +470,14 @@ pub use writer::{
     set_stripe_run_max_stripes, stripe_run_env_override, stripe_run_max_stripes,
     MAX_STRIPE_RUN_STRIPES,
 };
+/// Writer-lane batch accumulation targets — see
+/// [`crate::config::FlushConfig::writer_read_active_batch_target_units`]. Public
+/// for the same reason as the bundle width above: the A/B has to happen inside
+/// one process at one pool age.
+pub use writer::{
+    set_writer_batch_tuning, writer_batch_target_bytes, writer_batch_tuning,
+    writer_read_active_batch_target_units,
+};
 
 pub use failpoints::{
     clear_test_dedup_hit_failpoint, clear_test_failpoint, clear_test_packed_pause_hook,
