@@ -2,7 +2,12 @@
 # A/B the two OVERSIZED thread pools: `ublk.io_workers` and
 # `storage.read_pool_workers`.
 #
-#   thread_budget_ab.sh <tag> [config] [arms...]      arm = <io_workers>:<read_pool_workers>
+#   thread_budget_ab.sh <tag> [config] [arms...]
+#
+#   arm = <io_workers>:<read_pool_workers>[:<lv3_dedicated_cores>]
+#         the third field is optional and defaults to 0 (no dedication), so the
+#         two-field arms recorded in memory `thread_budget_io_readpool_ab`
+#         still mean what they meant.
 #
 # WHY. Box-measured 2026-09-15 (memory `thread_starvation_confirmed_census`),
 # QD256 j16d16 randrw 70/30 on an aged 256 GiB volume, two censuses 20+ min in:
@@ -72,13 +77,18 @@ VOL=${VOL:-fio-volume}
 mkdir -p "$OUT"
 echo "arms: $ARMS   burn ${BURN}s   sample ${SAMPLE}s   config $CFG" | tee "$OUT/plan"
 
-# Rewrite a knob in place, inserting it under its section if absent.
+# Rewrite a knob in place. Inserts it under its section if the key is absent,
+# and appends the section itself if that is missing too (`[cores]` is new, so a
+# config predating it has no such header to insert after).
 set_knob() {
     local key="$1" val="$2" section="$3"
     if grep -q "^${key}[[:space:]]*=" "$CFG"; then
         sed -i "s/^${key}[[:space:]]*=.*/${key} = ${val}/" "$CFG"
-    else
+    elif grep -q "^\\[${section}\\]" "$CFG"; then
         sed -i "0,/^\\[${section}\\]/s//[${section}]\\n${key} = ${val}/" "$CFG"
+    else
+        # At EOF, so no later bare key can be captured by the new section.
+        printf '\n[%s]\n%s = %s\n' "$section" "$key" "$val" >>"$CFG"
     fi
     grep -n "^${key}[[:space:]]*=" "$CFG"
 }
@@ -86,10 +96,11 @@ set_knob() {
 IDX=0
 for arm_spec in $ARMS; do
     IDX=$((IDX + 1))
-    io=${arm_spec%%:*}
-    rp=${arm_spec##*:}
-    arm="$IDX.io$io-rp$rp"
-    echo "=== arm $arm (io_workers=$io read_pool_workers=$rp)  $(date -Is) ===" | tee -a "$OUT/plan"
+    IFS=: read -r io rp lv3 <<<"$arm_spec"
+    lv3=${lv3:-0}
+    arm="$IDX.io$io-rp$rp-lv3$lv3"
+    echo "=== arm $arm (io_workers=$io read_pool_workers=$rp lv3_dedicated_cores=$lv3)  $(date -Is) ===" \
+        | tee -a "$OUT/plan"
 
     pkill -x fio 2>/dev/null
     sleep 2
@@ -99,6 +110,7 @@ for arm_spec in $ARMS; do
 
     set_knob io_workers "$io" ublk | tee -a "$OUT/plan"
     set_knob read_pool_workers "$rp" storage | tee -a "$OUT/plan"
+    set_knob lv3_dedicated_cores "$lv3" cores | tee -a "$OUT/plan"
 
     "$B" -c "$CFG" cleanup-ublk >/dev/null 2>&1
     sleep 3
@@ -137,6 +149,24 @@ for arm_spec in $ARMS; do
         echo "FAIL: arm $arm asked read_pool_workers=$rp but engine started $eff_rp" >&2
         exit 1
     fi
+    # `dedicated=[]` when nothing is carved out, `dedicated=[("Lv3Batch", [..])]`
+    # otherwise. Proving this per arm matters more than the other two: a pin
+    # that the stray-thread enforcer widens back would look identical in config
+    # and produce a silent duplicate baseline.
+    eff_ded=$(sed -E 's/\x1b\[[0-9;]*m//g' "$OUT/engine.$arm.log" \
+        | grep -m1 'numa confine active' | grep -oE 'dedicated=\[[^]]*\]?[^ ]*' | head -1)
+    echo "effective: $eff_ded" | tee -a "$OUT/plan"
+    if [ "$lv3" = "0" ]; then
+        case "$eff_ded" in
+            'dedicated=[]') : ;;
+            *) echo "FAIL: arm $arm asked for no dedication but got $eff_ded" >&2; exit 1 ;;
+        esac
+    else
+        case "$eff_ded" in
+            *Lv3Batch*) : ;;
+            *) echo "FAIL: arm $arm asked lv3_dedicated_cores=$lv3 but got $eff_ded" >&2; exit 1 ;;
+        esac
+    fi
     P=$(pgrep -nx onyx-storage)
     echo "threads at start: $(ls /proc/$P/task | wc -l)" | tee -a "$OUT/plan"
 
@@ -163,7 +193,11 @@ for arm_spec in $ARMS; do
 done
 
 pkill -x fio 2>/dev/null
-# Restore the shipped defaults so a later run does not inherit the last arm.
-set_knob io_workers 0 ublk | tee -a "$OUT/plan"
-set_knob read_pool_workers 32 storage | tee -a "$OUT/plan"
-echo "done — knobs restored (io_workers=0, read_pool_workers=32). Compare $OUT/census.* ."
+# Restore what the repo ships so a later run does not inherit the last arm.
+# ⚠ io_workers / read_pool_workers are now COMMITTED at 32 / 12 (they earned
+# it — memory `thread_budget_io_readpool_ab`), so restore those values, not the
+# pre-Phase-1 defaults. lv3_dedicated_cores ships at 0.
+set_knob io_workers 32 ublk | tee -a "$OUT/plan"
+set_knob read_pool_workers 12 storage | tee -a "$OUT/plan"
+set_knob lv3_dedicated_cores 0 cores | tee -a "$OUT/plan"
+echo "done — knobs restored to the shipped values. Compare $OUT/census.* ."

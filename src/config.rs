@@ -79,6 +79,27 @@ pub struct CoresConfig {
     /// 205.9 to 78.0 involuntary switches/s/thread; dedicating cores is the next
     /// step at that target.
     ///
+    /// ⛔⛔ MEASURED VERDICT (box 2026-09-16, 3 bracketed arms, QD256 j16d16
+    /// randrw 70/30 — memory `lv3_dedicated_cores_zero_sum`): **it works and it
+    /// buys nothing.** `lv3_dedicated_cores = 3` took this group's involuntary
+    /// preemption 48.4 → **0.36** switches/s/thread (134×), chunklet `compute`
+    /// 8.59 → 6.29 µs/stripe (−26.8%, halving the gap to the 4.56 µs standalone
+    /// CPU-only control) and r6 `write` −38.9% — and total throughput went
+    /// **−2.9%** against a +1.8% bracket drift, because the 6 logical CPUs come
+    /// out of the other 38: total involuntary switches rose 91k → 125k and
+    /// `ublk-io-worker` preemption 823 → 1116/s/thread.
+    ///
+    /// At 92% CPU utilisation, *moving* CPU between roles is zero-sum. That is
+    /// why this defaults to 0 despite the mechanism being correct: the phase
+    /// timings confirm the starvation measurement a second time, but the
+    /// "un-starve the drain and throughput follows" remedy does not hold for
+    /// the mixed workload. The lever that remains is reducing total demand
+    /// (voluntary switches outnumber involuntary 2.5:1; `%sys` was 26%), i.e.
+    /// removing stage boundaries rather than reallocating cores.
+    ///
+    /// ⚠ Untested at RWMIX=0, which is the only load where the LV3 drain is
+    /// the binding resource — so this verdict covers the mixed workload only.
+    ///
     /// ⚠ Sizing: there are `CHUNKLET_BATCH_EXECUTORS` = 6 executor threads, so
     /// 3 physical cores (6 logical, on this box's SMT2) is one thread per
     /// logical CPU. Fewer cores than that oversubscribes the dedicated set,
