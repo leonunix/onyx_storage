@@ -38,6 +38,73 @@ pub struct OnyxConfig {
     pub chunklet: ChunkletConfig,
     #[serde(default)]
     pub mem: MemConfig,
+    #[serde(default)]
+    pub cores: CoresConfig,
+}
+
+/// CPU-core budgeting ([`crate::affinity::CoreBudget`]).
+///
+/// Every worker pool in this engine sizes itself from the *config topology* —
+/// `buffer.shards × stages` for the flusher, `shards_per_partition` for metadb's
+/// apply lanes, `nr_queues × queue_workers` for ublk — and not one of them knows
+/// how many CPUs exist. Those topology knobs were each tuned for throughput or
+/// latency (`buffer.shards = 16` buys −68% append p99; `meta.dedup_shards = 8`
+/// buys READ p99 1199→476 ms) with no awareness that they multiply into OS
+/// threads, so the two concerns got welded together: there was no way to keep a
+/// sharding decision while spending fewer threads on it.
+///
+/// Box-measured 2026-09-15 (memory `thread_starvation_confirmed_census`): 622
+/// threads, **mean RUNNABLE 117 against 44 NUMA-confined cores**, mpstat 92%
+/// with most cores 94–100% busy, 187k involuntary context switches/s. Under
+/// `numa.mode = "confine"` all of them share ONE mask, because
+/// `numa.foreground_cores_per_node` defaults to 0 and `confine_cpu_sets` then
+/// returns the same full set for both halves — so the 6 LV3 parity executors
+/// carrying the 9.65× `compute` inflation get no reserved CPU at all.
+///
+/// This section is where a role's CPUs stop being an accident of its spawn site.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CoresConfig {
+    /// Physical cores (both HT siblings) carved out of the confine engine set
+    /// for the LV3 batch executors ([`crate::affinity::ThreadRole::Lv3Batch`])
+    /// to own exclusively. `0` (default) keeps them in the shared background
+    /// set, i.e. exactly the shipped behaviour.
+    ///
+    /// WHY this role first: RAID6 P/Q is the one stage whose cost is pure ALU,
+    /// so preemption shows up in it undiluted. `chunklet-perf` standalone does
+    /// the identical call with `compute` at 4.56 µs/stripe; under onyx the same
+    /// work measured 44 µs/stripe, and the per-phase ratios tracked CPU density
+    /// while the one pure-WAIT phase got *faster* (memory
+    /// `chunklet_call_slowdown_is_cpu_starvation`). Cutting `ublk.io_workers`
+    /// and `storage.read_pool_workers` already took this group's preemption from
+    /// 205.9 to 78.0 involuntary switches/s/thread; dedicating cores is the next
+    /// step at that target.
+    ///
+    /// ⚠ Sizing: there are `CHUNKLET_BATCH_EXECUTORS` = 6 executor threads, so
+    /// 3 physical cores (6 logical, on this box's SMT2) is one thread per
+    /// logical CPU. Fewer cores than that oversubscribes the dedicated set,
+    /// which defeats the point.
+    ///
+    /// ⚠ The carve-out is taken from the *background* half, and the budget
+    /// refuses to leave that half empty — a value large enough to starve
+    /// everything else is a startup error, not a warning.
+    ///
+    /// ⚠ Interaction with `chunklet.pd_write_background_workers`: chunklet's
+    /// background write-execution pool takes its CPUs from this same role
+    /// (`chunklet_pool::uring_pool_config` reads
+    /// `role_cpu_set(ThreadRole::Lv3Batch)`), so setting both puts chunklet's
+    /// `ckuring-bg-*` workers on these cores alongside the 6 executors and
+    /// oversubscribes the reservation. Both default to 0, so the combination
+    /// only happens deliberately — but size it as one pool if you do.
+    #[serde(default)]
+    pub lv3_dedicated_cores: usize,
+}
+
+impl Default for CoresConfig {
+    fn default() -> Self {
+        Self {
+            lv3_dedicated_cores: 0,
+        }
+    }
 }
 
 /// Hot-path memory scheduling ([`crate::mem`]).
@@ -2823,6 +2890,26 @@ fn default_shared_io_workers() -> bool {
 mod service_config_tests {
     use super::*;
     use std::io::Write;
+
+    /// Omitting `[cores]` must keep every role in the shared set, so the
+    /// budget is a mechanism before it is a policy.
+    #[test]
+    fn cores_dedications_default_to_none() {
+        let config: OnyxConfig = toml::from_str("").unwrap();
+        assert_eq!(config.cores.lv3_dedicated_cores, 0);
+    }
+
+    #[test]
+    fn cores_lv3_dedicated_cores_deserializes() {
+        let config: OnyxConfig = toml::from_str(
+            r#"
+                [cores]
+                lv3_dedicated_cores = 3
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.cores.lv3_dedicated_cores, 3);
+    }
 
     #[test]
     fn service_direct_io_cpus_defaults_to_unset() {

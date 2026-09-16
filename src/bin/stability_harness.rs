@@ -121,6 +121,7 @@ fn write_and_abort(
         numa: Default::default(),
         chunklet: Default::default(),
         mem: Default::default(),
+        cores: Default::default(),
     };
 
     let engine = OnyxEngine::open(&config).unwrap();

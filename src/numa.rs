@@ -719,7 +719,7 @@ fn setup_partition(config: &crate::config::OnyxConfig) -> crate::error::OnyxResu
         dedup_shard_pods: vec![home_pod; meta_dedup],
     });
 
-    spawn_confine_enforcer(all_cpus.clone(), all_cpus.clone());
+    spawn_confine_enforcer(Some(all_cpus.clone()));
     tracing::info!(
         data_nodes = ?data_nodes,
         home_pod,
@@ -809,18 +809,37 @@ fn setup_confine(config: &crate::config::OnyxConfig) -> crate::error::OnyxResult
             "failed to confine main thread to node {home} background cpus {background_cpus:?}: {err}"
         )));
     }
-    crate::affinity::init_confine(foreground_cpus.clone(), background_cpus.clone());
-    spawn_confine_enforcer(foreground_cpus.clone(), background_cpus.clone());
+    // The budget is the single answer to "which CPUs may this role use" —
+    // `bind_current` and the stray-thread enforcer both resolve through it, so
+    // a dedicated carve-out cannot be silently widened again by the sweep.
+    let mut budget = crate::affinity::CoreBudget::new(
+        cpus.clone(),
+        foreground_cpus.clone(),
+        background_cpus.clone(),
+    );
+    budget.dedicate(
+        crate::affinity::ThreadRole::Lv3Batch,
+        &node.cores,
+        config.cores.lv3_dedicated_cores,
+    )?;
+    let dedications: Vec<(String, Vec<usize>)> = budget
+        .dedications()
+        .into_iter()
+        .map(|(role, role_cpus)| (format!("{role:?}"), role_cpus.to_vec()))
+        .collect();
     tracing::info!(
         home_node = home,
         engine_cpus = ?cpus,
-        foreground_cpus = ?foreground_cpus,
-        background_cpus = ?background_cpus,
+        foreground_cpus = ?budget.foreground_cpus(),
+        background_cpus = ?budget.background_cpus(),
+        dedicated = ?dedications,
         direct_io_cpus = ?direct_io_cpus,
         reserved_cores = config.numa.reserve_cores_per_node,
         "numa confine active (in-engine numactl equivalent; ublk queue \
          threads included)"
     );
+    crate::affinity::init_confine(budget);
+    spawn_confine_enforcer(None);
     Ok(())
 }
 
@@ -830,21 +849,35 @@ fn setup_confine(config: &crate::config::OnyxConfig) -> crate::error::OnyxResult
 /// This low-frequency sweeper re-confines any thread of this process whose
 /// mask strays outside the allowed set, catching libublk today and any
 /// future self-pinning library. ~300 task dirs every 5s is noise.
+/// `partition_all_cpus` is `Some` only under `numa.mode = "partition"`, where
+/// every placeable thread is swept back to the union of the pods rather than to
+/// a per-role set (partition assigns roles to pods at spawn time via
+/// `PartitionTopo`, and the sweep only exists to catch libublk's self-pinning).
+/// Under confine it is `None` and the sweep resolves through the live
+/// [`crate::affinity::CoreBudget`].
 #[cfg(target_os = "linux")]
-fn spawn_confine_enforcer(foreground: Vec<usize>, background: Vec<usize>) {
+fn spawn_confine_enforcer(partition_all_cpus: Option<Vec<usize>>) {
     let _ = std::thread::Builder::new()
         .name("numa-confine".to_string())
         .spawn(move || loop {
-            sweep_stray_threads(&foreground, &background);
+            sweep_stray_threads(partition_all_cpus.as_deref());
             std::thread::sleep(std::time::Duration::from_secs(5));
         });
 }
 
 #[cfg(not(target_os = "linux"))]
-fn spawn_confine_enforcer(_foreground: Vec<usize>, _background: Vec<usize>) {}
+fn spawn_confine_enforcer(_partition_all_cpus: Option<Vec<usize>>) {}
 
 #[cfg(target_os = "linux")]
-fn sweep_stray_threads(foreground: &[usize], background: &[usize]) {
+fn sweep_stray_threads(partition_all_cpus: Option<&[usize]>) {
+    // Under confine, resolving through the live budget is what makes dedicated
+    // cores hold: the sweep compares masks EXACTLY and re-binds anything
+    // narrower, so a per-role carve-out is only stable if the sweep knows
+    // about it too.
+    let budget = crate::affinity::confine_budget();
+    if budget.is_none() && partition_all_cpus.is_none() {
+        return;
+    }
     let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
         return;
     };
@@ -864,13 +897,18 @@ fn sweep_stray_threads(foreground: &[usize], background: &[usize]) {
             continue; // thread exited
         }
         let name = std::fs::read_to_string(entry.path().join("comm")).unwrap_or_default();
-        let Some(use_foreground) = confine_thread_placement(&name) else {
-            continue;
-        };
-        let cpus = if use_foreground {
-            foreground
-        } else {
-            background
+        let cpus = match (budget, partition_all_cpus) {
+            (Some(budget), _) => match budget.cpus_for_thread_name(&name) {
+                Some(cpus) => cpus,
+                None => continue,
+            },
+            (None, Some(all)) => {
+                if crate::affinity::thread_pins_itself(&name) {
+                    continue;
+                }
+                all
+            }
+            (None, None) => continue,
         };
         let matches =
             (0..1024usize).all(|c| (unsafe { libc::CPU_ISSET(c, &set) }) == cpus.contains(&c));
@@ -887,25 +925,6 @@ fn sweep_stray_threads(foreground: &[usize], background: &[usize]) {
         if rc == 0 {
             tracing::info!(tid, "numa confine: re-bound stray thread (self-pinned outside the node, e.g. libublk queue daemon)");
         }
-    }
-}
-
-/// `None` preserves affinity explicitly selected by a load generator. Normal
-/// engine threads remain confined to the engine-owned CPU sets.
-fn confine_thread_placement(name: &str) -> Option<bool> {
-    let name = name.trim_end();
-    if name.starts_with("engine-bench-")
-        || name.starts_with("engine-submit-")
-        || name.starts_with("engine-durable-")
-        || name.starts_with("direct-io-")
-    {
-        None
-    } else if name.starts_with("ckuring-fg-") {
-        Some(true)
-    } else if name.starts_with("ckuring-bg-") {
-        Some(false)
-    } else {
-        Some(name.starts_with("ublk-") || name.starts_with("persistent-slot"))
     }
 }
 
@@ -1212,19 +1231,46 @@ mod tests {
         ));
     }
 
+    /// The enforcer resolves placement through `CoreBudget` now, so this
+    /// asserts the budget reproduces the rule the old `confine_thread_placement`
+    /// encoded — self-pinned threads untouched, ublk/LV2 foreground, everything
+    /// else background.
     #[test]
     fn confine_enforcer_preserves_engine_bench_affinity() {
-        assert_eq!(confine_thread_placement("engine-bench-7\n"), None);
-        assert_eq!(confine_thread_placement("engine-submit-7\n"), None);
-        assert_eq!(confine_thread_placement("engine-durable-7\n"), None);
-        assert_eq!(confine_thread_placement("direct-io-session-7\n"), None);
-        assert_eq!(confine_thread_placement("direct-io-submit-q0-w0\n"), None);
-        assert_eq!(confine_thread_placement("direct-io-durable-7\n"), None);
-        assert_eq!(confine_thread_placement("direct-io-writer-7\n"), None);
-        assert_eq!(confine_thread_placement("ublk-queue\n"), Some(true));
-        assert_eq!(confine_thread_placement("ckuring-fg-7\n"), Some(true));
-        assert_eq!(confine_thread_placement("ckuring-bg-11\n"), Some(false));
-        assert_eq!(confine_thread_placement("BufferSync-0\n"), Some(false));
+        let budget = crate::affinity::CoreBudget::new(
+            vec![0, 1, 2, 3],
+            vec![0, 1],
+            vec![2, 3],
+        );
+        for self_pinned in [
+            "engine-bench-7\n",
+            "engine-submit-7\n",
+            "engine-durable-7\n",
+            "direct-io-session-7\n",
+            "direct-io-submit-q0-w0\n",
+            "direct-io-durable-7\n",
+            "direct-io-writer-7\n",
+        ] {
+            assert_eq!(
+                budget.cpus_for_thread_name(self_pinned),
+                None,
+                "{self_pinned:?} must keep the affinity it chose"
+            );
+        }
+        for foreground in ["ublk-queue\n", "ckuring-fg-7\n", "persistent-slot-sync-3\n"] {
+            assert_eq!(
+                budget.cpus_for_thread_name(foreground),
+                Some(&[0usize, 1][..]),
+                "{foreground:?} belongs to the foreground half"
+            );
+        }
+        for background in ["ckuring-bg-11\n", "BufferSync-0\n", "flusher-writer-2\n"] {
+            assert_eq!(
+                budget.cpus_for_thread_name(background),
+                Some(&[2usize, 3][..]),
+                "{background:?} belongs to the background half"
+            );
+        }
     }
 
     #[test]

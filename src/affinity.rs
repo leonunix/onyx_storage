@@ -2,7 +2,7 @@ use std::sync::OnceLock;
 
 use crate::config::ThreadingConfig;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ThreadRole {
     Ublk,
     ReadPool,
@@ -31,6 +31,303 @@ pub enum ThreadRole {
     Background,
 }
 
+impl ThreadRole {
+    /// Number of variants — the width of [`CoreBudget`]'s per-role table.
+    pub const COUNT: usize = 13;
+
+    /// Dense index for per-role tables. Kept next to the enum so adding a
+    /// variant without extending `COUNT` fails to compile on the match.
+    pub const fn index(self) -> usize {
+        match self {
+            Self::Ublk => 0,
+            Self::ReadPool => 1,
+            Self::BufferSync => 2,
+            Self::FlusherCoalesce => 3,
+            Self::FlusherDedup => 4,
+            Self::FlusherCompress => 5,
+            Self::Lv3Batch => 6,
+            Self::FlusherWriter => 7,
+            Self::FlusherCleanup => 8,
+            Self::CommitWorker => 9,
+            Self::FlusherPostCommit => 10,
+            Self::MetadbCheckpoint => 11,
+            Self::Background => 12,
+        }
+    }
+}
+
+/// Which CPUs each role may run on under `numa.mode = "confine"`.
+///
+/// Before this existed, confine mode was two flat `Vec<usize>` (a foreground
+/// and a background half) plus a *separate* string-prefix function in
+/// `numa::confine_thread_placement` that the stray-thread enforcer used to
+/// decide the same question. Two mappings answering "where does this thread
+/// run" meant a role could not be given CPUs of its own: the enforcer does an
+/// EXACT mask comparison every 5 s and re-binds anything narrower, so any
+/// per-role pin was silently undone within one sweep. This type is the single
+/// answer both paths now go through.
+///
+/// It is deliberately NOT a scheduler. It owns one decision — the CPU set per
+/// role — so that a pool's thread count can stop being a function of config
+/// topology (see [`crate::config::CoresConfig`]) and start being a function of
+/// the cores actually available.
+#[derive(Clone, Debug, Default)]
+pub struct CoreBudget {
+    /// Every engine-usable logical CPU on the home node, i.e.
+    /// `NumaNode::engine_cpus(reserve_cores_per_node)`. This is the denominator
+    /// that no pool in the engine used to consult.
+    engine: Vec<usize>,
+    /// Foreground half: ublk and the LV2 sync threads. Equal to `engine` when
+    /// `numa.foreground_cores_per_node` is 0, which is the shipped default.
+    foreground: Vec<usize>,
+    /// Background half: everything else that has no dedicated set.
+    background: Vec<usize>,
+    /// Exclusive CPUs, indexed by [`ThreadRole::index`]. `None` means the role
+    /// shares the foreground/background half it would have used anyway, so an
+    /// all-`None` table reproduces the previous behaviour exactly.
+    dedicated: Vec<Option<Vec<usize>>>,
+}
+
+impl CoreBudget {
+    /// Build the shared-set budget: no role owns CPUs exclusively, which is
+    /// byte-for-byte the pre-budget confine behaviour.
+    pub fn new(engine: Vec<usize>, foreground: Vec<usize>, background: Vec<usize>) -> Self {
+        Self {
+            engine,
+            foreground,
+            background,
+            dedicated: vec![None; ThreadRole::COUNT],
+        }
+    }
+
+    /// Give `role` `core_count` physical cores of its own.
+    ///
+    /// Cores come off the END of the background half, matching
+    /// `NumaNode::engine_cpus`, which reserves the highest-numbered cores for
+    /// the OS — so the dedicated set lands adjacent to the OS reserve instead
+    /// of fragmenting the middle of the node.
+    ///
+    /// Both HT siblings of a core move together: handing out one sibling while
+    /// a shared pool keeps the other would leave the "dedicated" thread
+    /// sharing execution resources with whatever landed next door, which is
+    /// most of the interference this is meant to remove.
+    ///
+    /// ⚠ The taken CPUs are removed from **both** halves, not just the one
+    /// they were drawn from. `numa.foreground_cores_per_node` defaults to 0,
+    /// and `confine_cpu_sets` then returns the *same full engine set* for both
+    /// halves — so removing them from the background alone would leave ublk
+    /// and the LV2 sync threads still eligible to run there, and the
+    /// reservation would mean nothing in exactly the shipped configuration.
+    ///
+    /// Errors rather than warns when the carve-out would empty either half. A
+    /// config that starves other roles is a startup mistake, and the engine
+    /// already refuses over-budget confine configs rather than limping (see
+    /// `numa::setup_confine`).
+    pub fn dedicate(
+        &mut self,
+        role: ThreadRole,
+        cores: &[Vec<usize>],
+        core_count: usize,
+    ) -> crate::error::OnyxResult<()> {
+        if core_count == 0 {
+            return Ok(());
+        }
+        let background: std::collections::HashSet<usize> = self.background.iter().copied().collect();
+        // Only whole cores that live entirely in the background half can be
+        // taken; a core straddling the foreground boundary is not ours to move.
+        let candidates: Vec<&Vec<usize>> = cores
+            .iter()
+            .filter(|core| core.iter().all(|cpu| background.contains(cpu)))
+            .collect();
+        let taken: Vec<usize> = candidates
+            .iter()
+            .rev()
+            .take(core_count)
+            .flat_map(|core| core.iter().copied())
+            .collect();
+        let taken_set: std::collections::HashSet<usize> = taken.iter().copied().collect();
+        let background_left = self
+            .background
+            .iter()
+            .filter(|cpu| !taken_set.contains(cpu))
+            .count();
+        let foreground_left = self
+            .foreground
+            .iter()
+            .filter(|cpu| !taken_set.contains(cpu))
+            .count();
+        if candidates.len() < core_count || background_left == 0 || foreground_left == 0 {
+            return Err(crate::error::OnyxError::Config(format!(
+                "cores.{}_dedicated_cores = {core_count} does not fit: this node offers \
+                 {} whole background core(s), and the carve-out would leave \
+                 {foreground_left} foreground / {background_left} shared-background CPU(s) \
+                 (engine cpus {:?}). Lower it, or lower numa.reserve_cores_per_node / \
+                 numa.foreground_cores_per_node.",
+                role_knob_name(role),
+                candidates.len(),
+                self.engine,
+            )));
+        }
+        self.background.retain(|cpu| !taken_set.contains(cpu));
+        self.foreground.retain(|cpu| !taken_set.contains(cpu));
+        let mut taken = taken;
+        taken.sort_unstable();
+        self.dedicated[role.index()] = Some(taken);
+        Ok(())
+    }
+
+    /// CPUs `role` may run on: its exclusive set if it has one, else the half
+    /// it shares.
+    pub fn cpus_for(&self, role: ThreadRole) -> &[usize] {
+        if let Some(dedicated) = &self.dedicated[role.index()] {
+            return dedicated;
+        }
+        if role_uses_foreground_set(role) {
+            &self.foreground
+        } else {
+            &self.background
+        }
+    }
+
+    /// CPUs a thread should be confined to, resolved from its `comm`.
+    ///
+    /// `None` means "leave this thread's affinity alone" — load generators and
+    /// the direct-IO threads pin themselves deliberately.
+    ///
+    /// This is the enforcer's entry point, and it exists so the enforcer and
+    /// [`bind_current`] cannot disagree. The fallback is the historical
+    /// name-prefix rule, so a thread whose name maps to no role keeps landing
+    /// exactly where it did before.
+    pub fn cpus_for_thread_name(&self, name: &str) -> Option<&[usize]> {
+        let name = name.trim_end();
+        if thread_pins_itself(name) {
+            return None;
+        }
+        // A role with CPUs of its own must be recognised here, or the enforcer
+        // would widen it back to the shared half on the next sweep.
+        if let Some(role) = role_for_thread_name(name) {
+            if self.dedicated[role.index()].is_some() {
+                return Some(self.cpus_for(role));
+            }
+        }
+        Some(if name_uses_foreground_set(name) {
+            &self.foreground
+        } else {
+            &self.background
+        })
+    }
+
+    pub fn engine_cpus(&self) -> &[usize] {
+        &self.engine
+    }
+
+    pub fn foreground_cpus(&self) -> &[usize] {
+        &self.foreground
+    }
+
+    pub fn background_cpus(&self) -> &[usize] {
+        &self.background
+    }
+
+    /// Roles holding exclusive CPUs, for the startup log.
+    pub fn dedications(&self) -> Vec<(ThreadRole, &[usize])> {
+        ALL_THREAD_ROLES
+            .iter()
+            .filter_map(|&role| {
+                self.dedicated[role.index()]
+                    .as_deref()
+                    .map(|cpus| (role, cpus))
+            })
+            .collect()
+    }
+}
+
+const ALL_THREAD_ROLES: [ThreadRole; ThreadRole::COUNT] = [
+    ThreadRole::Ublk,
+    ThreadRole::ReadPool,
+    ThreadRole::BufferSync,
+    ThreadRole::FlusherCoalesce,
+    ThreadRole::FlusherDedup,
+    ThreadRole::FlusherCompress,
+    ThreadRole::Lv3Batch,
+    ThreadRole::FlusherWriter,
+    ThreadRole::FlusherCleanup,
+    ThreadRole::CommitWorker,
+    ThreadRole::FlusherPostCommit,
+    ThreadRole::MetadbCheckpoint,
+    ThreadRole::Background,
+];
+
+/// Config key stem for a role, used only in the `dedicate` error message.
+fn role_knob_name(role: ThreadRole) -> &'static str {
+    match role {
+        ThreadRole::Lv3Batch => "lv3",
+        other => {
+            debug_assert!(false, "no cores.* knob defined for {other:?}");
+            "unknown"
+        }
+    }
+}
+
+/// Threads whose affinity the engine must not touch: load generators pin
+/// themselves to model a client, and the direct-IO frontend pins its own
+/// workers from `service.direct_io_cpus`. Re-confining either would erase a
+/// deliberate placement.
+///
+/// Shared by the confine budget and by partition mode's enforcer so the two
+/// cannot drift on which threads are off-limits.
+pub fn thread_pins_itself(name: &str) -> bool {
+    let name = name.trim_end();
+    name.starts_with("engine-bench-")
+        || name.starts_with("engine-submit-")
+        || name.starts_with("engine-durable-")
+        || name.starts_with("direct-io-")
+}
+
+/// Map a thread's `comm` back to its role.
+///
+/// Only roles that can hold dedicated CPUs need an entry — everything else
+/// falls through to [`name_uses_foreground_set`], which reproduces the
+/// historical placement. ⚠ Adding a `cores.*_dedicated_cores` knob for a new
+/// role REQUIRES adding its name prefixes here, or the stray-thread enforcer
+/// will undo the pin on its next sweep.
+///
+/// ⚠ Linux truncates `comm` to 15 characters (`TASK_COMM_LEN`), so match on
+/// prefixes short enough to survive it: `lv3-batch-aggregate` arrives as
+/// `lv3-batch-aggre`.
+fn role_for_thread_name(name: &str) -> Option<ThreadRole> {
+    if name.starts_with("lv3-batch-") {
+        return Some(ThreadRole::Lv3Batch);
+    }
+    // chunklet's persistent write-execution pools take their CPU sets from
+    // these same two roles (`chunklet_pool::uring_pool_config` reads
+    // `role_cpu_set(BufferSync)` / `role_cpu_set(Lv3Batch)`), so the enforcer
+    // has to resolve them the same way or it would fight chunklet's own
+    // pinning every 5 s. With no dedication in play both fall through to the
+    // historical foreground/background rule, unchanged.
+    if name.starts_with("ckuring-bg-") {
+        return Some(ThreadRole::Lv3Batch);
+    }
+    if name.starts_with("ckuring-fg-") {
+        return Some(ThreadRole::BufferSync);
+    }
+    None
+}
+
+/// The historical foreground/background rule, by thread name. Kept verbatim
+/// from `numa::confine_thread_placement` so the budget is a refactor and not a
+/// behaviour change: only ublk and the LV2 sync threads are foreground, plus
+/// chunklet's explicitly-tagged uring pools.
+fn name_uses_foreground_set(name: &str) -> bool {
+    if name.starts_with("ckuring-fg-") {
+        return true;
+    }
+    if name.starts_with("ckuring-bg-") {
+        return false;
+    }
+    name.starts_with("ublk-") || name.starts_with("persistent-slot")
+}
+
 #[derive(Clone, Debug, Default)]
 struct AffinityLayout {
     ublk: CpuSet,
@@ -54,16 +351,14 @@ struct CpuSet {
 enum LayoutKind {
     /// Legacy `[threading]` per-role single-CPU pinning.
     PerRole(AffinityLayout),
-    /// `[numa] mode = "confine"`: every role binds to the same CPU *set*
-    /// (the home node minus reserved cores), keeping scheduler freedom
-    /// inside the node — the in-engine equivalent of
+    /// `[numa] mode = "confine"`: roles bind to a CPU *set* from the
+    /// [`CoreBudget`] (the home node minus reserved cores, split into a
+    /// foreground/background half plus any dedicated carve-outs), keeping
+    /// scheduler freedom inside the set — the in-engine equivalent of
     /// `numactl --cpunodebind`, but it also covers libublk's per-queue
     /// threads because the per-thread `bind_current` runs after libublk's
     /// own affinity call and overrides it.
-    ConfineSets {
-        foreground: Vec<usize>,
-        background: Vec<usize>,
-    },
+    Confine(CoreBudget),
     /// `[numa] mode = "partition"`: sharded roles bind to their shard's pod
     /// (one pod per data node), singletons bind to the home pod. Threads
     /// also set their own memory policy to prefer the pod's node so Tier A
@@ -191,11 +486,8 @@ pub fn init(config: &ThreadingConfig) {
 /// inherit the caller's node-wide mask, which matches the proven
 /// "numactl + threading.enabled=false" profile where metadb runs unpinned
 /// inside the node.
-pub fn init_confine(foreground: Vec<usize>, background: Vec<usize>) {
-    let _ = LAYOUT.set(Some(LayoutKind::ConfineSets {
-        foreground,
-        background,
-    }));
+pub fn init_confine(budget: CoreBudget) {
+    let _ = LAYOUT.set(Some(LayoutKind::Confine(budget)));
 }
 
 /// Partition-mode layout (see `PartitionTopo`).
@@ -216,7 +508,16 @@ pub fn role_cpu_set(role: ThreadRole) -> Vec<usize> {
 /// Whether the active runtime layout uses the strict foreground/background
 /// confine split.
 pub fn is_confine_layout() -> bool {
-    matches!(LAYOUT.get(), Some(Some(LayoutKind::ConfineSets { .. })))
+    matches!(LAYOUT.get(), Some(Some(LayoutKind::Confine(_))))
+}
+
+/// The active confine budget, for the stray-thread enforcer. `None` under any
+/// other layout.
+pub fn confine_budget() -> Option<&'static CoreBudget> {
+    match LAYOUT.get() {
+        Some(Some(LayoutKind::Confine(budget))) => Some(budget),
+        _ => None,
+    }
 }
 
 pub fn bind_current(role: ThreadRole, ordinal: usize) {
@@ -230,14 +531,7 @@ pub fn bind_current(role: ThreadRole, ordinal: usize) {
             };
             set_current_cpus(&[cpu])
         }
-        LayoutKind::ConfineSets {
-            foreground,
-            background,
-        } => set_current_cpus(if role_uses_foreground_set(role) {
-            foreground
-        } else {
-            background
-        }),
+        LayoutKind::Confine(budget) => set_current_cpus(budget.cpus_for(role)),
         LayoutKind::Partition(topo) => {
             let pod = &topo.pods[topo.pod_index(role, ordinal)];
             // Tier A first-touch locality: this thread's future allocations
@@ -263,16 +557,7 @@ impl LayoutKind {
     fn cpu_set_for_role(&self, role: ThreadRole) -> Vec<usize> {
         match self {
             Self::PerRole(layout) => layout.cpus_for(role).cpus.clone(),
-            Self::ConfineSets {
-                foreground,
-                background,
-            } => {
-                if role_uses_foreground_set(role) {
-                    foreground.clone()
-                } else {
-                    background.clone()
-                }
-            }
+            Self::Confine(budget) => budget.cpus_for(role).to_vec(),
             Self::Partition(topo) => topo.cpu_set_for_role(role),
         }
     }
@@ -383,6 +668,192 @@ impl CpuSet {
 }
 
 #[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    /// 4 physical cores, SMT2, mirroring the box layout (even CPUs = node 0).
+    fn cores4() -> Vec<Vec<usize>> {
+        vec![vec![0, 8], vec![2, 10], vec![4, 12], vec![6, 14]]
+    }
+
+    fn shared_budget() -> CoreBudget {
+        let engine: Vec<usize> = cores4().into_iter().flatten().collect();
+        let mut engine = engine;
+        engine.sort_unstable();
+        CoreBudget::new(engine.clone(), engine.clone(), engine)
+    }
+
+    /// `numa.foreground_cores_per_node = 0` makes both halves the full engine
+    /// set, so with no dedications every role resolves to the same CPUs — this
+    /// is the pre-budget behaviour the refactor must preserve.
+    #[test]
+    fn no_dedications_gives_every_role_the_whole_engine_set() {
+        let budget = shared_budget();
+        let all: &[usize] = &[0, 2, 4, 6, 8, 10, 12, 14];
+        for role in ALL_THREAD_ROLES {
+            assert_eq!(budget.cpus_for(role), all, "{role:?}");
+        }
+        assert!(budget.dedications().is_empty());
+    }
+
+    #[test]
+    fn dedicate_takes_whole_cores_off_the_end_and_removes_them_from_background() {
+        let mut budget = shared_budget();
+        budget
+            .dedicate(ThreadRole::Lv3Batch, &cores4(), 1)
+            .expect("1 of 4 cores leaves 3 shared");
+
+        // Highest core taken, both HT siblings together.
+        assert_eq!(budget.cpus_for(ThreadRole::Lv3Batch), &[6, 14]);
+        // Gone from the shared half, so nothing else can be scheduled there.
+        assert_eq!(budget.background_cpus(), &[0, 2, 4, 8, 10, 12]);
+        for cpu in [6, 14] {
+            assert!(
+                !budget.cpus_for(ThreadRole::FlusherWriter).contains(&cpu),
+                "cpu {cpu} is dedicated and must not appear in a shared set"
+            );
+        }
+        assert_eq!(
+            budget.dedications().len(),
+            1,
+            "only Lv3Batch holds exclusive CPUs"
+        );
+    }
+
+    /// The enforcer compares masks exactly and re-binds anything narrower, so
+    /// a dedicated thread is only stable if its name resolves to the dedicated
+    /// set. This is the assertion that would have caught the pin being undone
+    /// every 5 seconds.
+    #[test]
+    fn enforcer_resolves_dedicated_threads_to_their_own_cores() {
+        let mut budget = shared_budget();
+        budget.dedicate(ThreadRole::Lv3Batch, &cores4(), 1).unwrap();
+
+        // Both spawn-site names, including the one Linux truncates at 15 chars
+        // ("lv3-batch-aggregate" -> "lv3-batch-aggre").
+        for name in ["lv3-batch-exec-0\n", "lv3-batch-aggre\n"] {
+            assert_eq!(
+                budget.cpus_for_thread_name(name),
+                Some(&[6usize, 14][..]),
+                "{name:?} must sweep to the dedicated set, not the shared half"
+            );
+        }
+        // A role without dedicated CPUs still lands on the shared half.
+        assert_eq!(
+            budget.cpus_for_thread_name("flusher-compress-1-0\n"),
+            Some(&[0usize, 2, 4, 8, 10, 12][..])
+        );
+    }
+
+    /// chunklet pins its own write-execution workers from the same two roles,
+    /// so the enforcer must resolve them identically or the two will fight.
+    #[test]
+    fn chunklet_uring_pools_track_the_roles_they_borrow_cpus_from() {
+        // No dedications: both fall through to the historical rule, which is
+        // what makes this mapping safe to add on its own.
+        let shared = shared_budget();
+        let all: &[usize] = &[0, 2, 4, 6, 8, 10, 12, 14];
+        assert_eq!(shared.cpus_for_thread_name("ckuring-bg-3\n"), Some(all));
+        assert_eq!(shared.cpus_for_thread_name("ckuring-fg-3\n"), Some(all));
+
+        // With Lv3Batch dedicated, the background uring pool follows it —
+        // matching `chunklet_pool::uring_pool_config`'s
+        // `role_cpu_set(Lv3Batch)`.
+        let mut budget = shared_budget();
+        budget.dedicate(ThreadRole::Lv3Batch, &cores4(), 1).unwrap();
+        assert_eq!(
+            budget.cpus_for_thread_name("ckuring-bg-3\n"),
+            Some(&[6usize, 14][..])
+        );
+        // The foreground pool borrows BufferSync, which has no dedication —
+        // but the dedicated CPUs are gone from the foreground half too, so it
+        // cannot land on LV3's cores either.
+        assert_eq!(
+            budget.cpus_for_thread_name("ckuring-fg-3\n"),
+            Some(&[0usize, 2, 4, 8, 10, 12][..])
+        );
+    }
+
+    /// The reservation is only real if it holds against the FOREGROUND half as
+    /// well. With `numa.foreground_cores_per_node = 0` both halves are the same
+    /// full engine set, so a carve-out that only edited the background would
+    /// leave ublk and the LV2 sync threads free to run on the dedicated cores —
+    /// i.e. it would be a no-op in exactly the shipped configuration.
+    #[test]
+    fn dedicated_cores_leave_the_foreground_half_too() {
+        let mut budget = shared_budget();
+        assert_eq!(budget.foreground_cpus(), budget.background_cpus());
+        budget.dedicate(ThreadRole::Lv3Batch, &cores4(), 1).unwrap();
+
+        for cpu in [6, 14] {
+            assert!(
+                !budget.foreground_cpus().contains(&cpu),
+                "cpu {cpu} is dedicated to LV3 and must not stay in the foreground half"
+            );
+        }
+        // Concretely: ublk and LV2 sync can no longer be scheduled there.
+        for role in [ThreadRole::Ublk, ThreadRole::BufferSync] {
+            assert_eq!(budget.cpus_for(role), &[0, 2, 4, 8, 10, 12], "{role:?}");
+        }
+    }
+
+    /// Every role named in `role_for_thread_name` must have a `cores.*` knob
+    /// name, because `dedicate`'s error message quotes it.
+    #[test]
+    fn dedicated_capable_roles_have_a_knob_name() {
+        assert_eq!(role_knob_name(ThreadRole::Lv3Batch), "lv3");
+        assert_eq!(
+            role_for_thread_name("lv3-batch-exec-3"),
+            Some(ThreadRole::Lv3Batch)
+        );
+    }
+
+    #[test]
+    fn dedicating_every_core_is_a_startup_error_not_a_warning() {
+        let mut budget = shared_budget();
+        // 4 whole cores exist; asking for all 4 would leave the shared half
+        // empty, and so would asking for more.
+        for ask in [4, 5, 99] {
+            let mut b = budget.clone();
+            assert!(
+                matches!(
+                    b.dedicate(ThreadRole::Lv3Batch, &cores4(), ask),
+                    Err(crate::error::OnyxError::Config(_))
+                ),
+                "dedicating {ask} of 4 cores must be refused"
+            );
+        }
+        // 3 of 4 is the most that can be granted.
+        budget
+            .dedicate(ThreadRole::Lv3Batch, &cores4(), 3)
+            .expect("3 of 4 cores leaves 1 shared");
+        assert_eq!(budget.background_cpus(), &[0, 8]);
+    }
+
+    #[test]
+    fn dedicate_zero_is_a_no_op() {
+        let mut budget = shared_budget();
+        let before = budget.background_cpus().to_vec();
+        budget.dedicate(ThreadRole::Lv3Batch, &cores4(), 0).unwrap();
+        assert_eq!(budget.background_cpus(), before.as_slice());
+        assert!(budget.dedications().is_empty());
+    }
+
+    /// A core straddling the foreground boundary is not the background half's
+    /// to hand out.
+    #[test]
+    fn dedicate_only_takes_cores_wholly_inside_the_background_half() {
+        let engine: Vec<usize> = vec![0, 2, 4, 6, 8, 10, 12, 14];
+        // Foreground owns core {6,14}; background owns the other three.
+        let mut budget = CoreBudget::new(engine, vec![6, 14], vec![0, 2, 4, 8, 10, 12]);
+        budget.dedicate(ThreadRole::Lv3Batch, &cores4(), 1).unwrap();
+        // {6,14} is foreground, so the highest *background* core is taken.
+        assert_eq!(budget.cpus_for(ThreadRole::Lv3Batch), &[4, 12]);
+        assert_eq!(budget.foreground_cpus(), &[6, 14]);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -485,14 +956,26 @@ mod tests {
         );
         assert_eq!(per_role.cpu_set_for_role(ThreadRole::Lv3Batch), vec![8, 9]);
 
-        let confine = LayoutKind::ConfineSets {
-            foreground: vec![0, 2],
-            background: vec![4, 6],
-        };
+        let confine = LayoutKind::Confine(CoreBudget::new(
+            vec![0, 2, 4, 6],
+            vec![0, 2],
+            vec![4, 6],
+        ));
         assert_eq!(confine.cpu_set_for_role(ThreadRole::Ublk), vec![0, 2]);
         assert_eq!(confine.cpu_set_for_role(ThreadRole::BufferSync), vec![0, 2]);
         assert_eq!(confine.cpu_set_for_role(ThreadRole::Background), vec![4, 6]);
         assert_eq!(confine.cpu_set_for_role(ThreadRole::Lv3Batch), vec![4, 6]);
+
+        // Same layout, but Lv3Batch now owns core {6}: it leaves the shared
+        // background set and nothing else follows it there.
+        let mut dedicated_budget = CoreBudget::new(vec![0, 2, 4, 6], vec![0, 2], vec![4, 6]);
+        dedicated_budget
+            .dedicate(ThreadRole::Lv3Batch, &[vec![0], vec![2], vec![4], vec![6]], 1)
+            .unwrap();
+        let confine = LayoutKind::Confine(dedicated_budget);
+        assert_eq!(confine.cpu_set_for_role(ThreadRole::Lv3Batch), vec![6]);
+        assert_eq!(confine.cpu_set_for_role(ThreadRole::Background), vec![4]);
+        assert_eq!(confine.cpu_set_for_role(ThreadRole::Ublk), vec![0, 2]);
 
         let partition = LayoutKind::Partition(topo2());
         assert_eq!(
