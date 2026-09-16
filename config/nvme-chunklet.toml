@@ -549,3 +549,20 @@ arena_enabled = true
 arena_max_bytes_per_lane = 0   # 0 = 64 MiB ceiling per lane; grows on demand
 arena_max_class_blocks = 0     # 0 = 64 blocks (256 KiB), covers stripe + max unit
 arena_hugepage = false
+
+[cores]
+# Physical cores carved out of the confine engine set for the 6 LV3 batch
+# executors to own exclusively. 0 = they stay in the shared background set.
+#
+# ⛔⛔ MEASURED 2026-09-16, 3 bracketed arms (memory `lv3_dedicated_cores_zero_sum`):
+# it WORKS and it buys NOTHING. At 3 (6 logical CPUs for 6 threads) this group's
+# involuntary preemption fell 48.4 -> 0.36 switches/s/thread (134x), chunklet
+# `compute` 8.59 -> 6.29 us/stripe (-26.8%, halving the gap to the 4.56 us
+# standalone CPU-only control) and r6 `write` -38.9% -- while total throughput
+# went -2.9% against a +1.8% bracket drift, because the 6 CPUs come out of the
+# other 38: total involuntary switches rose 91k -> 125k and ublk-io-worker
+# preemption 823 -> 1116/s/thread.
+#
+# At 92% CPU utilisation, MOVING cpu between roles is zero-sum. Keep it at 0.
+# ⚠ Untested at RWMIX=0, the only load where the LV3 drain actually binds.
+lv3_dedicated_cores = 0
