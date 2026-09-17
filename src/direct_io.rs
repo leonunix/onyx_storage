@@ -391,6 +391,66 @@ struct SubmitLanes {
     groups_per_lane: usize,
 }
 
+/// Everything `SubmitLanes::start` needs, kept so the pool can be built on the
+/// first accepted connection instead of at service start.
+///
+/// WHY LAZY. This frontend is an instrument (see `SubmitLanes::start` on why its
+/// concurrency is deliberately unbounded), but the pool used to be built
+/// eagerly at `DirectIoServer::start`, which runs unconditionally — so a ublk
+/// deployment that never opens a direct-IO socket still paid
+/// `nr_queues * queue_workers` = **128 threads**. Box census 2026-09-16
+/// (memory `thread_starvation_confirmed_census`) measured those 128 at
+/// **0.00 mean runnable and 0.0 involuntary switches/s over 98 s** — 26% of the
+/// engine's 498 threads, costing no CPU but carrying stacks, crossbeam
+/// wake-path entries and `/proc` noise. Building on first use costs one
+/// pool-construction (~ms) on the first connection and nothing at all when the
+/// socket is never used.
+struct SubmitLanesConfig {
+    nr_queues: usize,
+    queue_workers: usize,
+    shared: bool,
+    workers_override: Option<usize>,
+    direct_io_cpus: Arc<Vec<usize>>,
+}
+
+/// Lazily-built submit pool, shared between the listener (which builds it) and
+/// `DirectIoServer` (which joins it on shutdown).
+type LazySubmitLanes = Arc<parking_lot::Mutex<Option<SubmitLanes>>>;
+
+/// Build the pool if this is the first session, and hand back its lane queues.
+/// `None` means construction failed and the caller must refuse the connection.
+fn ensure_submit_lanes(
+    slot: &LazySubmitLanes,
+    config: &SubmitLanesConfig,
+) -> Option<Arc<Vec<WorkerQueue<SubmitTask>>>> {
+    let mut guard = slot.lock();
+    if guard.is_none() {
+        match SubmitLanes::start(
+            config.nr_queues,
+            config.queue_workers,
+            config.shared,
+            config.workers_override,
+            config.direct_io_cpus.clone(),
+        ) {
+            Ok(lanes) => {
+                tracing::info!(
+                    submit_lanes = lanes.lanes.len(),
+                    groups_per_lane = lanes.groups_per_lane,
+                    receivers_per_group = crate::worker_queue::MAX_RECEIVERS_PER_CHANNEL,
+                    workers_per_lane = lanes.workers_per_lane,
+                    "direct IO submit pool started on first session"
+                );
+                *guard = Some(lanes);
+            }
+            Err(error) => {
+                tracing::warn!(%error, "failed to start direct IO submit pool");
+                return None;
+            }
+        }
+    }
+    guard.as_ref().map(|lanes| lanes.lanes.clone())
+}
+
 impl SubmitLanes {
     /// `shared` collapses the per-lane partition into ONE queue served by all
     /// `nr_queues * queue_workers` threads. A session is otherwise pinned to
@@ -482,7 +542,9 @@ pub struct DirectIoServer {
     socket_path: PathBuf,
     shutdown: Arc<ShutdownState>,
     listener_handle: Option<JoinHandle<()>>,
-    submit_lanes: Option<SubmitLanes>,
+    /// `None` inside the mutex until the first session builds the pool — see
+    /// [`SubmitLanesConfig`]. Shutdown takes it out to join the workers.
+    submit_lanes: LazySubmitLanes,
 }
 
 impl DirectIoServer {
@@ -510,14 +572,18 @@ impl DirectIoServer {
 
         let direct_io_cpus = Arc::new(direct_io_cpus);
         let logged_direct_io_cpus = direct_io_cpus.clone();
-        let submit_lanes = SubmitLanes::start(
+        // The pool is NOT built here — see `SubmitLanesConfig`. The socket still
+        // binds and listens eagerly, so a client can connect at any time; it is
+        // only the 128 worker threads that wait until someone does.
+        let lane_config = SubmitLanesConfig {
             nr_queues,
             queue_workers,
-            shared_submit_pool,
-            submit_workers_override,
-            direct_io_cpus.clone(),
-        )?;
-        let lane_handles = submit_lanes.lanes.clone();
+            shared: shared_submit_pool,
+            workers_override: submit_workers_override,
+            direct_io_cpus: direct_io_cpus.clone(),
+        };
+        let submit_lanes: LazySubmitLanes = Arc::new(parking_lot::Mutex::new(None));
+        let lane_handles = submit_lanes.clone();
         let shutdown = Arc::new(ShutdownState::new());
         let thread_shutdown = shutdown.clone();
         let listener_handle = thread::Builder::new()
@@ -528,6 +594,7 @@ impl DirectIoServer {
                     listener,
                     engine,
                     lane_handles,
+                    lane_config,
                     queue_workers,
                     direct_io_cpus,
                     thread_shutdown,
@@ -536,7 +603,6 @@ impl DirectIoServer {
         let listener_handle = match listener_handle {
             Ok(handle) => handle,
             Err(error) => {
-                submit_lanes.shutdown_and_join();
                 let _ = fs::remove_file(&socket_path);
                 return Err(error);
             }
@@ -544,18 +610,14 @@ impl DirectIoServer {
 
         tracing::info!(
             path = %socket_path.display(),
-            submit_lanes = submit_lanes.lanes.len(),
-            groups_per_lane = submit_lanes.groups_per_lane,
-            receivers_per_group = crate::worker_queue::MAX_RECEIVERS_PER_CHANNEL,
-            workers_per_lane = submit_lanes.workers_per_lane,
             direct_io_cpus = ?logged_direct_io_cpus,
-            "direct IO socket listening"
+            "direct IO socket listening (submit pool starts on first session)"
         );
         Ok(Self {
             socket_path,
             shutdown,
             listener_handle: Some(listener_handle),
-            submit_lanes: Some(submit_lanes),
+            submit_lanes,
         })
     }
 
@@ -571,7 +633,10 @@ impl DirectIoServer {
                 tracing::error!(?error, "direct IO listener panicked");
             }
         }
-        if let Some(submit_lanes) = self.submit_lanes.take() {
+        // Take it out of the shared slot: the listener has joined by now, so
+        // nothing can build a second pool behind us. Still `None` when no
+        // session ever connected, in which case there is nothing to join.
+        if let Some(submit_lanes) = self.submit_lanes.lock().take() {
             submit_lanes.shutdown_and_join();
         }
     }
@@ -586,7 +651,8 @@ impl Drop for DirectIoServer {
 fn listener_loop(
     listener: UnixListener,
     engine: Arc<ArcSwap<Option<OnyxEngine>>>,
-    submit_lanes: Arc<Vec<WorkerQueue<SubmitTask>>>,
+    submit_lanes: LazySubmitLanes,
+    lane_config: SubmitLanesConfig,
     queue_workers: usize,
     direct_io_cpus: Arc<Vec<usize>>,
     shutdown: Arc<ShutdownState>,
@@ -605,12 +671,18 @@ fn listener_loop(
                     let _ = stream.shutdown(std::net::Shutdown::Both);
                     continue;
                 }
+                // First session pays for building the pool; later ones find it
+                // already there. A build failure refuses the connection rather
+                // than accepting a session with nowhere to submit.
+                let Some(lane) = ensure_submit_lanes(&submit_lanes, &lane_config) else {
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    continue;
+                };
                 let session_id = next_session_id;
                 next_session_id = next_session_id.wrapping_add(1);
                 let session_engine = engine.clone();
                 let session_shutdown = shutdown.clone();
-                let lane_id = session_id % submit_lanes.len();
-                let lane = submit_lanes.clone();
+                let lane_id = session_id % lane.len();
                 let session_cpus = direct_io_cpus.clone();
                 match thread::Builder::new()
                     .name(format!("direct-io-session-{session_id}"))
@@ -1860,6 +1932,50 @@ mod tests {
         assert_eq!(
             direct_io_socket_path(Path::new("/tmp/onyx.sock")),
             Path::new("/tmp/onyx.sock.io")
+        );
+    }
+
+    /// The submit pool must not exist until someone connects. This is the
+    /// whole of the 128-thread saving: `DirectIoServer::start` runs
+    /// unconditionally, so a ublk deployment that never opens this socket used
+    /// to carry `nr_queues * queue_workers` worker threads measured at 0.00
+    /// mean runnable (memory `thread_starvation_confirmed_census`).
+    #[test]
+    fn submit_pool_is_not_built_until_a_session_connects() {
+        let dir = tempfile::tempdir().unwrap();
+        let control_path = dir.path().join("control.sock");
+        let engine = Arc::new(ArcSwap::from_pointee(None::<OnyxEngine>));
+        let mut server =
+            DirectIoServer::start(&control_path, engine, 8, 4, true, None, Vec::new()).unwrap();
+
+        assert!(
+            server.submit_lanes.lock().is_none(),
+            "listening must not cost any submit worker threads"
+        );
+
+        // One connection is enough to arm it; the listener builds the pool
+        // before it spawns the session.
+        let client = UnixStream::connect(server.socket_path()).unwrap();
+        let armed = (0..200).any(|_| {
+            if server.submit_lanes.lock().is_some() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            false
+        });
+        assert!(armed, "first session must build the submit pool");
+        let built = server.submit_lanes.lock().as_ref().map(|l| l.workers_per_lane);
+        assert_eq!(
+            built,
+            Some(32),
+            "shared mode sizes the pool nr_queues * queue_workers"
+        );
+
+        drop(client);
+        server.shutdown_and_join();
+        assert!(
+            server.submit_lanes.lock().is_none(),
+            "shutdown must take the pool out of the shared slot and join it"
         );
     }
 

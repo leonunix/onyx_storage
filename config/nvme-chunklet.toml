@@ -444,6 +444,29 @@ shared_io_workers = true
 io_workers = 32
 
 [flush]
+# ── Shared stage pools: one pool per stage instead of one per buffer shard ──
+#
+# WHY. The flusher's five stages are sized `buffer.shards x workers`, so 16
+# shards spend 112 OS threads. Box census 2026-09-16 (memory
+# `thread_starvation_confirmed_census`) measured the whole 112-thread pipeline at
+# 15.1 mean runnable on 44 confined cores — i.e. the thread count is ~7x the CPU
+# demand, and the engine was 2.2x oversubscribed with 187k involuntary context
+# switches/s. These pools were built and box-measured earlier (memory
+# `flush_compress_cleanup_shared_pool`, throughput flat at 638 -> 554 threads)
+# but were never turned on in this config.
+#
+# Each job carries its own routing (`CoalesceUnit`/`CompressedUnit.shard_idx`),
+# so a pool worker returns its result to the shard it came from; `false`
+# reproduces the per-shard behaviour exactly. Sizes default to 8 / 4 / 8, at or
+# under `worker_queue::MAX_RECEIVERS_PER_CHANNEL` — do NOT raise them past 8
+# without routing through `WorkerQueue`, or admission hits the crossbeam
+# O(receivers)-under-one-mutex cliff (-36% measured on the direct-IO pool).
+#
+#   compress  16 x 2 = 32  ->  8
+#   cleanup   16 x 1 = 16  ->  4
+#   dedup     16 x 2 = 32  ->  8
+shared_compress_pool = true
+shared_cleanup_pool = true
 compress_workers = 2
 # Coalesce to exactly ONE RAID6 stripe (6 × 4 KiB = 24 KiB). A full coalesce
 # unit is then a stripe multiple, so `raid_full_stripe_writes` can align it and
@@ -515,6 +538,11 @@ buffer_usage_resume_pct = 50
 max_rewrite_per_cycle = 1024
 
 [dedup]
+# Shared dedup stage pool: 16 x 2 = 32 threads -> 8. See the pool note under
+# [flush]. The dedup loop reads the UNIT's shard_idx (not the worker's) for its
+# backpressure gate, done-route and miss-route, which is what makes sharing it
+# safe — see DedupConfig::shared_pool.
+shared_pool = true
 enabled = true
 workers = 2
 buffer_skip_threshold_pct = 90
