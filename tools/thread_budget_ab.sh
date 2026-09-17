@@ -4,11 +4,19 @@
 #
 #   thread_budget_ab.sh <tag> [config] [arms...]
 #
-#   arm = <io_workers>:<read_pool_workers>[:<lv3_cores>[:<lv2_cores>[:<reserve_cores>]]]
+#   arm = <io_workers>:<read_pool_workers>[:<lv3_cores>[:<lv2_cores>[:<reserve_cores>[:<nr_queues>]]]]
 #         Trailing fields are optional and default to the shipped values
-#         (lv3=0, lv2=0, reserve=2), so the shorter arms recorded in memory
-#         `thread_budget_io_readpool_ab` / `lv3_dedicated_cores_zero_sum` still
-#         mean what they meant.
+#         (lv3=0, lv2=0, reserve=2, nr_queues=32), so the shorter arms recorded
+#         in memory `thread_budget_io_readpool_ab` /
+#         `lv3_dedicated_cores_zero_sum` still mean what they meant.
+#
+#   nr_queues is `ublk.nr_queues`, the kernel device's queue count, and each
+#   queue costs one libublk `ublk-<vol>` OS thread (33 threads at 32, 9 at 8).
+#   ⚠ It is ALSO the default source for `io_workers` (`nr_queues *
+#   queue_workers`) and for the direct-io submit pool, so an arm that moves it
+#   must pin `io_workers` explicitly — otherwise two knobs move at once and the
+#   census cannot attribute either. Pass io_workers=32 (the shipped value) on
+#   every nr_queues arm; the self-proof below enforces that they are consistent.
 #
 #   reserve_cores is `numa.reserve_cores_per_node`. Lowering it GROWS the
 #   budget's denominator (44 logical CPUs at 2, 46 at 1, 48 at 0 on this box),
@@ -102,11 +110,15 @@ set_knob() {
 IDX=0
 for arm_spec in $ARMS; do
     IDX=$((IDX + 1))
-    IFS=: read -r io rp lv3 lv2 rsv <<<"$arm_spec"
-    lv3=${lv3:-0}; lv2=${lv2:-0}; rsv=${rsv:-2}
-    arm="$IDX.io$io-rp$rp-lv3$lv3-lv2$lv2-rsv$rsv"
-    echo "=== arm $arm (io_workers=$io read_pool_workers=$rp lv3_cores=$lv3 lv2_cores=$lv2 reserve_cores=$rsv)  $(date -Is) ===" \
+    IFS=: read -r io rp lv3 lv2 rsv nrq <<<"$arm_spec"
+    lv3=${lv3:-0}; lv2=${lv2:-0}; rsv=${rsv:-2}; nrq=${nrq:-32}
+    arm="$IDX.io$io-rp$rp-lv3$lv3-lv2$lv2-rsv$rsv-nrq$nrq"
+    echo "=== arm $arm (io_workers=$io read_pool_workers=$rp lv3_cores=$lv3 lv2_cores=$lv2 reserve_cores=$rsv nr_queues=$nrq)  $(date -Is) ===" \
         | tee -a "$OUT/plan"
+    if [ "$nrq" != "32" ] && [ "$io" = "0" ]; then
+        echo "FAIL: arm $arm moves nr_queues with io_workers=0, so io_workers would move too" >&2
+        exit 1
+    fi
 
     pkill -x fio 2>/dev/null
     sleep 2
@@ -119,6 +131,7 @@ for arm_spec in $ARMS; do
     set_knob lv3_dedicated_cores "$lv3" cores | tee -a "$OUT/plan"
     set_knob lv2_dedicated_cores "$lv2" cores | tee -a "$OUT/plan"
     set_knob reserve_cores_per_node "$rsv" numa | tee -a "$OUT/plan"
+    set_knob nr_queues "$nrq" ublk | tee -a "$OUT/plan"
 
     "$B" -c "$CFG" cleanup-ublk >/dev/null 2>&1
     sleep 3
@@ -146,11 +159,20 @@ for arm_spec in $ARMS; do
         | grep -m1 'read pool started with foreground isolation' \
         | grep -oE '\bworkers=[0-9]+' | head -1 | cut -d= -f2)
     want_io=$io
-    [ "$io" = "0" ] && want_io=128      # nr_queues(32) * queue_workers(4)
-    echo "effective: io_workers=$eff_io (want $want_io)  read_pool_workers=$eff_rp (want $rp)" \
+    [ "$io" = "0" ] && want_io=$((nrq * 4))   # nr_queues * queue_workers(4)
+    # Same log line carries `nr_queues`, so the device geometry proves itself
+    # from the engine's own view rather than from the config we just wrote.
+    eff_nrq=$(sed -E 's/\x1b\[[0-9;]*m//g' "$OUT/engine.$arm.log" \
+        | grep -m1 'ublk shared io worker pool started' \
+        | grep -oE 'nr_queues=[0-9]+' | head -1 | cut -d= -f2)
+    echo "effective: io_workers=$eff_io (want $want_io)  read_pool_workers=$eff_rp (want $rp)  nr_queues=$eff_nrq (want $nrq)" \
         | tee -a "$OUT/plan"
     if [ "$eff_io" != "$want_io" ]; then
         echo "FAIL: arm $arm asked io_workers=$want_io but engine started $eff_io" >&2
+        exit 1
+    fi
+    if [ "$eff_nrq" != "$nrq" ]; then
+        echo "FAIL: arm $arm asked nr_queues=$nrq but engine started $eff_nrq" >&2
         exit 1
     fi
     if [ -n "$eff_rp" ] && [ "$eff_rp" != "$rp" ]; then
@@ -225,4 +247,5 @@ set_knob read_pool_workers 12 storage | tee -a "$OUT/plan"
 set_knob lv3_dedicated_cores 0 cores | tee -a "$OUT/plan"
 set_knob lv2_dedicated_cores 0 cores | tee -a "$OUT/plan"
 set_knob reserve_cores_per_node 2 numa | tee -a "$OUT/plan"
+set_knob nr_queues 32 ublk | tee -a "$OUT/plan"
 echo "done — knobs restored to the shipped values. Compare $OUT/census.* ."

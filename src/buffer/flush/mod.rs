@@ -173,6 +173,12 @@ pub struct BufferFlusher {
     /// Non-empty only when `DedupConfig::shared_pool` is set — every lane's
     /// `FlusherLane::dedup_handles` is empty in that mode.
     shared_dedup_handles: Vec<JoinHandle<()>>,
+    /// Non-empty only when `FlushConfig::shared_coalesce_pool` is set — every
+    /// lane's `FlusherLane::coalesce_handle` is `None` in that mode. Joined in
+    /// the same pass as the per-lane coalescers: this stage is the sole
+    /// producer into dedup, so it must fully exit before that channel's senders
+    /// count as dropped.
+    shared_coalesce_handles: Vec<JoinHandle<()>>,
 }
 
 struct FlusherLane {

@@ -1,6 +1,6 @@
 use super::*;
 
-mod coalesce;
+pub(in crate::buffer::flush) mod coalesce;
 mod compress;
 mod dedup;
 

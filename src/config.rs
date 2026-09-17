@@ -2223,6 +2223,44 @@ pub struct FlushConfig {
     /// default (4) — cleanup does less CPU work per item than compress.
     #[serde(default)]
     pub cleanup_pool_workers: usize,
+    /// Serve every shard's admission stage (`coalesce_loop` in
+    /// `src/buffer/flush/stages/coalesce.rs`) from ONE pool of
+    /// `coalesce_pool_workers` drivers instead of one dedicated thread per
+    /// shard.
+    ///
+    /// WHY: this stage is **over-provisioned, not overloaded**. Box census
+    /// 2026-09-17 after the global compression (QD256 j16d16 randrw 70/30, 44
+    /// confined cores, memory `global_thread_compression_498_to_310`):
+    ///
+    /// ```text
+    /// group             threads  mean runnable  R%     voluntary sw/s
+    /// flusher-coalesc        16      3.32      20.8%       15,813
+    /// flusher-writer-        16      1.03       6.5%        2,977
+    /// ```
+    ///
+    /// 16 threads carrying 3.32 mean runnable is a ~5× over-provision, the
+    /// same ratio that made `shared_compress_pool` / `shared_cleanup_pool` /
+    /// `dedup.shared_pool` free wins.
+    ///
+    /// ⛔ **This does NOT delete a pipeline boundary, and it was mis-sold as
+    /// doing so.** The `done_tx` feedback channel a coalescer reads is fed by
+    /// the dedup workers and the commit workers, not by the writer, so it
+    /// survives any regrouping of this stage. The win here is thread count and
+    /// nothing else; budget for it accordingly.
+    ///
+    /// Unlike the other three shared pools this is NOT one channel with N
+    /// receivers — each shard keeps its own ready/done channels and its own
+    /// accumulator state, and a driver **claims** a lane for one pass. So
+    /// `worker_queue::MAX_RECEIVERS_PER_CHANNEL` does not apply; the
+    /// meaningful bound is `buffer.shards`, above which extra drivers only
+    /// lose claim races. `false` (default) reproduces today's
+    /// one-thread-per-shard behavior exactly.
+    #[serde(default)]
+    pub shared_coalesce_pool: bool,
+    /// Pool size when `shared_coalesce_pool` is set. 0 = a small fixed default
+    /// (8), clamped to `buffer.shards`.
+    #[serde(default)]
+    pub coalesce_pool_workers: usize,
     /// Max raw bytes to coalesce before compressing (default 128KB)
     #[serde(default = "default_coalesce_max_raw_bytes")]
     pub coalesce_max_raw_bytes: usize,
@@ -2525,6 +2563,8 @@ impl Default for FlushConfig {
             compress_pool_workers: 0,
             shared_cleanup_pool: false,
             cleanup_pool_workers: 0,
+            shared_coalesce_pool: false,
+            coalesce_pool_workers: 0,
             coalesce_max_raw_bytes: default_coalesce_max_raw_bytes(),
             coalesce_max_lbas: default_coalesce_max_lbas(),
             min_compression_savings_pct: default_min_compression_savings_pct(),
@@ -2958,6 +2998,43 @@ fn default_shared_io_workers() -> bool {
 mod service_config_tests {
     use super::*;
     use std::io::Write;
+
+    /// The admission pool ships OFF, like the other three flusher pools did
+    /// before they earned their way into `config/nvme-chunklet.toml`. A default
+    /// flip would change the shape of the drain stage on every deployment
+    /// without a measurement behind it.
+    #[test]
+    fn shared_coalesce_pool_defaults_to_off() {
+        let config: OnyxConfig = toml::from_str("").unwrap();
+        assert!(!config.flush.shared_coalesce_pool);
+        assert_eq!(config.flush.coalesce_pool_workers, 0);
+    }
+
+    #[test]
+    fn shared_coalesce_pool_knobs_deserialize_independently() {
+        let config: OnyxConfig = toml::from_str(
+            r#"
+                [flush]
+                shared_coalesce_pool = true
+                coalesce_pool_workers = 6
+            "#,
+        )
+        .unwrap();
+        assert!(config.flush.shared_coalesce_pool);
+        assert_eq!(config.flush.coalesce_pool_workers, 6);
+
+        // Enabling the pool without sizing it must stay legal: 0 means "use
+        // the built-in default", not "run zero drivers".
+        let unsized_pool: OnyxConfig = toml::from_str(
+            r#"
+                [flush]
+                shared_coalesce_pool = true
+            "#,
+        )
+        .unwrap();
+        assert!(unsized_pool.flush.shared_coalesce_pool);
+        assert_eq!(unsized_pool.flush.coalesce_pool_workers, 0);
+    }
 
     /// Omitting `[cores]` must keep every role in the shared set, so the
     /// budget is a mechanism before it is a policy.

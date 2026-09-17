@@ -273,6 +273,20 @@ impl BufferFlusher {
         } else {
             4
         };
+        // The admission stage is pooled by CLAIM, not by a shared channel:
+        // each shard keeps its own ready/done channels and its own
+        // accumulator state, and a driver takes one lane exclusively for one
+        // pass. So there is no receiver-per-channel bound to warn about below;
+        // the meaningful bound is the shard count, above which extra drivers
+        // only lose claim races.
+        let shared_coalesce_pool = config.shared_coalesce_pool;
+        let coalesce_pool_workers = if config.coalesce_pool_workers > 0 {
+            config.coalesce_pool_workers
+        } else {
+            8
+        }
+        .min(lane_count);
+        let mut coalesce_lanes: Vec<super::stages::coalesce::CoalesceLane> = Vec::new();
         let shared_dedup_pool = dedup_config.shared_pool;
         let dedup_pool_workers = if dedup_config.pool_workers > 0 {
             dedup_config.pool_workers
@@ -438,29 +452,46 @@ impl BufferFlusher {
             } else {
                 compress_tx.clone()
             };
-            let coalesce_handle = thread::Builder::new()
-                .name(format!("flusher-coalesce-{}", shard_idx))
-                .spawn(move || {
-                    affinity::bind_current(ThreadRole::FlusherCoalesce, shard_idx);
-                    Self::coalesce_loop(
-                        shard_idx,
-                        &pool_c,
-                        &meta_c,
-                        &coalesce_out_tx,
-                        &done_rx,
-                        &running_c,
-                        &in_flight_c,
-                        &metrics_c,
-                        max_raw,
-                        max_lbas,
-                        skip_fully_superseded,
-                        buffer_write_window,
-                        buffer_write_window_pressure_pct,
-                        buffer_write_window_payload_pressure_pct,
-                        &flush_admission_qos_c,
-                    );
-                })
-                .expect("failed to spawn coalescer thread");
+            // Shared mode collects this shard's channels into a claimable lane
+            // and leaves the handle `None`; the driver pool is spawned after
+            // the loop. Private mode spawns the dedicated thread exactly as
+            // before.
+            let coalesce_handle = if shared_coalesce_pool {
+                coalesce_lanes.push(super::stages::coalesce::CoalesceLane::new(
+                    shard_idx,
+                    coalesce_out_tx,
+                    done_rx,
+                    &metrics,
+                    buffer_write_window,
+                ));
+                None
+            } else {
+                Some(
+                    thread::Builder::new()
+                        .name(format!("flusher-coalesce-{}", shard_idx))
+                        .spawn(move || {
+                            affinity::bind_current(ThreadRole::FlusherCoalesce, shard_idx);
+                            Self::coalesce_loop(
+                                shard_idx,
+                                &pool_c,
+                                &meta_c,
+                                &coalesce_out_tx,
+                                &done_rx,
+                                &running_c,
+                                &in_flight_c,
+                                &metrics_c,
+                                max_raw,
+                                max_lbas,
+                                skip_fully_superseded,
+                                buffer_write_window,
+                                buffer_write_window_pressure_pct,
+                                buffer_write_window_payload_pressure_pct,
+                                &flush_admission_qos_c,
+                            );
+                        })
+                        .expect("failed to spawn coalescer thread"),
+                )
+            };
 
             // Private pool only — shared mode leaves this empty and the
             // shared dedup pool (spawned after this loop, once
@@ -637,13 +668,69 @@ impl BufferFlusher {
             });
 
             lanes.push(FlusherLane {
-                coalesce_handle: Some(coalesce_handle),
+                coalesce_handle,
                 dedup_handles,
                 compress_handles,
                 writer_handle: Some(writer_handle),
                 cleanup_handle,
             });
         }
+
+        // The admission driver pool. Spawned here rather than inside the loop
+        // because every driver shares ALL the lanes — a lane cannot be offered
+        // until the last shard's channels exist.
+        let shared_coalesce_handles = if shared_coalesce_pool {
+            let lanes_shared = Arc::new(std::mem::take(&mut coalesce_lanes));
+            // ONE counter for the whole pool: that is what makes the rotation a
+            // fairness guarantee rather than a per-driver heuristic. See
+            // `coalesce_shared_loop`.
+            let next_lane = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            tracing::info!(
+                drivers = coalesce_pool_workers,
+                lanes = lanes_shared.len(),
+                "flusher shared coalesce pool started (drivers claim one lane per pass)"
+            );
+            (0..coalesce_pool_workers)
+                .map(|worker_idx| {
+                    let lanes_c = lanes_shared.clone();
+                    let next_c = next_lane.clone();
+                    let running_c = running.clone();
+                    let pool_c = pool.clone();
+                    let meta_c = meta.clone();
+                    let metrics_c = metrics.clone();
+                    let in_flight_c = in_flight.clone();
+                    let qos_c = flush_admission_qos.clone();
+                    thread::Builder::new()
+                        .name(format!("flusher-coalesce-shared-{worker_idx}"))
+                        .spawn(move || {
+                            affinity::bind_current(ThreadRole::FlusherCoalesce, worker_idx);
+                            let params = super::stages::coalesce::CoalesceParams {
+                                max_raw,
+                                max_lbas,
+                                skip_fully_superseded,
+                                write_window: buffer_write_window,
+                                write_window_pressure_pct: buffer_write_window_pressure_pct,
+                                write_window_payload_pressure_pct:
+                                    buffer_write_window_payload_pressure_pct,
+                                flush_admission_qos: &qos_c,
+                            };
+                            Self::coalesce_shared_loop(
+                                &lanes_c,
+                                &next_c,
+                                &pool_c,
+                                &meta_c,
+                                &running_c,
+                                &in_flight_c,
+                                &metrics_c,
+                                &params,
+                            );
+                        })
+                        .expect("failed to spawn shared coalesce driver")
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         // Shared pools, spawned once every shard's channels/senders exist.
         // Compress needs `lane_write_txs` complete first (routing table);
@@ -889,6 +976,7 @@ impl BufferFlusher {
             shared_compress_handles,
             shared_cleanup_handles,
             shared_dedup_handles,
+            shared_coalesce_handles,
         }
     }
 
@@ -1050,6 +1138,11 @@ impl BufferFlusher {
             if let Some(h) = lane.coalesce_handle.take() {
                 let _ = h.join();
             }
+        }
+        // Shared mode: the driver pool IS pass 1. Same rule as the per-lane
+        // handles above — whichever collection is non-empty is the live one.
+        for h in self.shared_coalesce_handles.drain(..) {
+            let _ = h.join();
         }
         // Dedup: either every lane's own dedicated handles (private mode)
         // or the one shared pool (shared mode) — whichever is non-empty is
