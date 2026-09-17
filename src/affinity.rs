@@ -132,12 +132,18 @@ impl CoreBudget {
         if core_count == 0 {
             return Ok(());
         }
-        let background: std::collections::HashSet<usize> = self.background.iter().copied().collect();
-        // Only whole cores that live entirely in the background half can be
-        // taken; a core straddling the foreground boundary is not ours to move.
+        // Draw from the half this role would otherwise share, so a foreground
+        // role (BufferSync) does not get cores carved out of the background
+        // pool it never ran on. Only whole cores count: one straddling the
+        // foreground/background boundary is not that half's to hand out.
+        let own_half: std::collections::HashSet<usize> = if role_uses_foreground_set(role) {
+            self.foreground.iter().copied().collect()
+        } else {
+            self.background.iter().copied().collect()
+        };
         let candidates: Vec<&Vec<usize>> = cores
             .iter()
-            .filter(|core| core.iter().all(|cpu| background.contains(cpu)))
+            .filter(|core| core.iter().all(|cpu| own_half.contains(cpu)))
             .collect();
         let taken: Vec<usize> = candidates
             .iter()
@@ -159,10 +165,10 @@ impl CoreBudget {
         if candidates.len() < core_count || background_left == 0 || foreground_left == 0 {
             return Err(crate::error::OnyxError::Config(format!(
                 "cores.{}_dedicated_cores = {core_count} does not fit: this node offers \
-                 {} whole background core(s), and the carve-out would leave \
-                 {foreground_left} foreground / {background_left} shared-background CPU(s) \
-                 (engine cpus {:?}). Lower it, or lower numa.reserve_cores_per_node / \
-                 numa.foreground_cores_per_node.",
+                 {} whole core(s) in the half {role:?} shares, and the carve-out would \
+                 leave {foreground_left} foreground / {background_left} shared-background \
+                 CPU(s) (engine cpus {:?}). Lower it, lower another cores.* knob, or give \
+                 cores back with numa.reserve_cores_per_node.",
                 role_knob_name(role),
                 candidates.len(),
                 self.engine,
@@ -262,6 +268,7 @@ const ALL_THREAD_ROLES: [ThreadRole; ThreadRole::COUNT] = [
 fn role_knob_name(role: ThreadRole) -> &'static str {
     match role {
         ThreadRole::Lv3Batch => "lv3",
+        ThreadRole::BufferSync => "lv2",
         other => {
             debug_assert!(false, "no cores.* knob defined for {other:?}");
             "unknown"
@@ -298,6 +305,12 @@ pub fn thread_pins_itself(name: &str) -> bool {
 fn role_for_thread_name(name: &str) -> Option<ThreadRole> {
     if name.starts_with("lv3-batch-") {
         return Some(ThreadRole::Lv3Batch);
+    }
+    // The LV2 commit-log sync threads: one `persistent-slot-sync-global`
+    // coordinator plus `persistent-slot-sync-<shard>`, and the prepare/lane
+    // threads inside the global loop bind under the same role.
+    if name.starts_with("persistent-slot") {
+        return Some(ThreadRole::BufferSync);
     }
     // chunklet's persistent write-execution pools take their CPU sets from
     // these same two roles (`chunklet_pool::uring_pool_config` reads
@@ -802,10 +815,67 @@ mod budget_tests {
     #[test]
     fn dedicated_capable_roles_have_a_knob_name() {
         assert_eq!(role_knob_name(ThreadRole::Lv3Batch), "lv3");
+        assert_eq!(role_knob_name(ThreadRole::BufferSync), "lv2");
         assert_eq!(
             role_for_thread_name("lv3-batch-exec-3"),
             Some(ThreadRole::Lv3Batch)
         );
+        for name in [
+            "persistent-slot-sync-7",
+            "persistent-slot-sync-global",
+            "persistent-slot", // 15-char comm truncation
+        ] {
+            assert_eq!(
+                role_for_thread_name(name),
+                Some(ThreadRole::BufferSync),
+                "{name:?}"
+            );
+        }
+    }
+
+    /// BufferSync is a FOREGROUND role, so its cores must come out of the
+    /// foreground half — carving them from the background pool it never ran on
+    /// would reserve the wrong CPUs and leave it sharing as before.
+    #[test]
+    fn dedicating_a_foreground_role_draws_from_the_foreground_half() {
+        let engine: Vec<usize> = vec![0, 2, 4, 6, 8, 10, 12, 14];
+        // Foreground owns cores {0,8} and {2,10}; background owns the rest.
+        // Both halves sorted, as `NumaNode::confine_cpu_sets` returns them.
+        let mut budget = CoreBudget::new(engine, vec![0, 2, 8, 10], vec![4, 6, 12, 14]);
+        budget
+            .dedicate(ThreadRole::BufferSync, &cores4(), 1)
+            .unwrap();
+        // The highest whole FOREGROUND core, not the highest core overall.
+        assert_eq!(budget.cpus_for(ThreadRole::BufferSync), &[2, 10]);
+        assert_eq!(budget.foreground_cpus(), &[0, 8]);
+        // Background is untouched: the carve-out did not raid the other half.
+        assert_eq!(budget.background_cpus(), &[4, 6, 12, 14]);
+    }
+
+    /// Both knobs at once: LV2 is dedicated first, so LV3 draws from what is
+    /// left and the two sets stay disjoint.
+    #[test]
+    fn two_dedications_do_not_overlap() {
+        let mut budget = shared_budget();
+        budget
+            .dedicate(ThreadRole::BufferSync, &cores4(), 1)
+            .unwrap();
+        budget.dedicate(ThreadRole::Lv3Batch, &cores4(), 1).unwrap();
+
+        let lv2 = budget.cpus_for(ThreadRole::BufferSync).to_vec();
+        let lv3 = budget.cpus_for(ThreadRole::Lv3Batch).to_vec();
+        assert_eq!(lv2, vec![6, 14], "LV2 claims first, so it takes the top core");
+        assert_eq!(lv3, vec![4, 12]);
+        assert!(
+            lv2.iter().all(|cpu| !lv3.contains(cpu)),
+            "dedicated sets must be disjoint: lv2={lv2:?} lv3={lv3:?}"
+        );
+        // Neither set remains schedulable by anyone else.
+        for cpu in lv2.iter().chain(lv3.iter()) {
+            assert!(!budget.cpus_for(ThreadRole::FlusherWriter).contains(cpu));
+            assert!(!budget.cpus_for(ThreadRole::Ublk).contains(cpu));
+        }
+        assert_eq!(budget.dedications().len(), 2);
     }
 
     #[test]

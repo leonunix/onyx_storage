@@ -4,10 +4,16 @@
 #
 #   thread_budget_ab.sh <tag> [config] [arms...]
 #
-#   arm = <io_workers>:<read_pool_workers>[:<lv3_dedicated_cores>]
-#         the third field is optional and defaults to 0 (no dedication), so the
-#         two-field arms recorded in memory `thread_budget_io_readpool_ab`
-#         still mean what they meant.
+#   arm = <io_workers>:<read_pool_workers>[:<lv3_cores>[:<lv2_cores>[:<reserve_cores>]]]
+#         Trailing fields are optional and default to the shipped values
+#         (lv3=0, lv2=0, reserve=2), so the shorter arms recorded in memory
+#         `thread_budget_io_readpool_ab` / `lv3_dedicated_cores_zero_sum` still
+#         mean what they meant.
+#
+#   reserve_cores is `numa.reserve_cores_per_node`. Lowering it GROWS the
+#   budget's denominator (44 logical CPUs at 2, 46 at 1, 48 at 0 on this box),
+#   which is the only way a dedication stops being strictly zero-sum — see the
+#   note on `cores.lv2_dedicated_cores`.
 #
 # WHY. Box-measured 2026-09-15 (memory `thread_starvation_confirmed_census`),
 # QD256 j16d16 randrw 70/30 on an aged 256 GiB volume, two censuses 20+ min in:
@@ -96,10 +102,10 @@ set_knob() {
 IDX=0
 for arm_spec in $ARMS; do
     IDX=$((IDX + 1))
-    IFS=: read -r io rp lv3 <<<"$arm_spec"
-    lv3=${lv3:-0}
-    arm="$IDX.io$io-rp$rp-lv3$lv3"
-    echo "=== arm $arm (io_workers=$io read_pool_workers=$rp lv3_dedicated_cores=$lv3)  $(date -Is) ===" \
+    IFS=: read -r io rp lv3 lv2 rsv <<<"$arm_spec"
+    lv3=${lv3:-0}; lv2=${lv2:-0}; rsv=${rsv:-2}
+    arm="$IDX.io$io-rp$rp-lv3$lv3-lv2$lv2-rsv$rsv"
+    echo "=== arm $arm (io_workers=$io read_pool_workers=$rp lv3_cores=$lv3 lv2_cores=$lv2 reserve_cores=$rsv)  $(date -Is) ===" \
         | tee -a "$OUT/plan"
 
     pkill -x fio 2>/dev/null
@@ -111,6 +117,8 @@ for arm_spec in $ARMS; do
     set_knob io_workers "$io" ublk | tee -a "$OUT/plan"
     set_knob read_pool_workers "$rp" storage | tee -a "$OUT/plan"
     set_knob lv3_dedicated_cores "$lv3" cores | tee -a "$OUT/plan"
+    set_knob lv2_dedicated_cores "$lv2" cores | tee -a "$OUT/plan"
+    set_knob reserve_cores_per_node "$rsv" numa | tee -a "$OUT/plan"
 
     "$B" -c "$CFG" cleanup-ublk >/dev/null 2>&1
     sleep 3
@@ -153,20 +161,35 @@ for arm_spec in $ARMS; do
     # otherwise. Proving this per arm matters more than the other two: a pin
     # that the stray-thread enforcer widens back would look identical in config
     # and produce a silent duplicate baseline.
-    eff_ded=$(sed -E 's/\x1b\[[0-9;]*m//g' "$OUT/engine.$arm.log" \
-        | grep -m1 'numa confine active' | grep -oE 'dedicated=\[[^]]*\]?[^ ]*' | head -1)
-    echo "effective: $eff_ded" | tee -a "$OUT/plan"
-    if [ "$lv3" = "0" ]; then
-        case "$eff_ded" in
-            'dedicated=[]') : ;;
-            *) echo "FAIL: arm $arm asked for no dedication but got $eff_ded" >&2; exit 1 ;;
-        esac
-    else
-        case "$eff_ded" in
-            *Lv3Batch*) : ;;
-            *) echo "FAIL: arm $arm asked lv3_dedicated_cores=$lv3 but got $eff_ded" >&2; exit 1 ;;
-        esac
+    confine_line=$(sed -E 's/\x1b\[[0-9;]*m//g' "$OUT/engine.$arm.log" \
+        | grep -m1 'numa confine active')
+    eff_ded=$(echo "$confine_line" | grep -oE 'dedicated=\[.*\] direct_io_cpus' \
+        | sed 's/ direct_io_cpus//')
+    # engine_cpus is the budget denominator; `reserve_cores` shows the knob the
+    # engine actually read back. Counting the list proves the reserve arm did
+    # something (44 CPUs at reserve=2, 46 at 1, 48 at 0 on this box).
+    eff_engine=$(echo "$confine_line" | grep -oE 'engine_cpus=\[[^]]*\]' \
+        | tr ',' '\n' | grep -c '[0-9]')
+    eff_rsv=$(echo "$confine_line" | grep -oE 'reserved_cores=[0-9]+' | cut -d= -f2)
+    echo "effective: $eff_ded | engine_cpus=$eff_engine reserved_cores=$eff_rsv" \
+        | tee -a "$OUT/plan"
+    if [ "$eff_rsv" != "$rsv" ]; then
+        echo "FAIL: arm $arm asked reserve_cores_per_node=$rsv but engine read $eff_rsv" >&2
+        exit 1
     fi
+    for pair in "Lv3Batch:$lv3" "BufferSync:$lv2"; do
+        role=${pair%%:*}; want=${pair##*:}
+        if [ "$want" = "0" ]; then
+            case "$eff_ded" in
+                *"$role"*) echo "FAIL: arm $arm wanted no $role dedication, got $eff_ded" >&2; exit 1 ;;
+            esac
+        else
+            case "$eff_ded" in
+                *"$role"*) : ;;
+                *) echo "FAIL: arm $arm wanted $role x$want cores, got $eff_ded" >&2; exit 1 ;;
+            esac
+        fi
+    done
     P=$(pgrep -nx onyx-storage)
     echo "threads at start: $(ls /proc/$P/task | wc -l)" | tee -a "$OUT/plan"
 
@@ -200,4 +223,6 @@ pkill -x fio 2>/dev/null
 set_knob io_workers 32 ublk | tee -a "$OUT/plan"
 set_knob read_pool_workers 12 storage | tee -a "$OUT/plan"
 set_knob lv3_dedicated_cores 0 cores | tee -a "$OUT/plan"
+set_knob lv2_dedicated_cores 0 cores | tee -a "$OUT/plan"
+set_knob reserve_cores_per_node 2 numa | tee -a "$OUT/plan"
 echo "done — knobs restored to the shipped values. Compare $OUT/census.* ."

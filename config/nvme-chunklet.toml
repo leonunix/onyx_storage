@@ -566,3 +566,19 @@ arena_hugepage = false
 # At 92% CPU utilisation, MOVING cpu between roles is zero-sum. Keep it at 0.
 # ⚠ Untested at RWMIX=0, the only load where the LV3 drain actually binds.
 lv3_dedicated_cores = 0
+# Physical cores for the LV2 commit-log sync threads (persistent-slot-sync-*).
+#
+# ⭐ SIZE FROM `mean runnable`, NOT thread count — that is what the LV3 arm above
+# got wrong. Post-Phase-1 census on 44 confined cores:
+#   ublk-io-worker-   32 thr  meanR 10.6-11.7   792-855 involuntary sw/s/thread
+#   persistent-slot   33 thr  meanR  7.9-8.6    611-655
+#   read-pool-fg       6 thr  meanR  3.4-3.7   1063-1170
+#   lv3-batch-exec-    6 thr  meanR  0.87           48
+# LV2 is the engine's SECOND-largest CPU consumer; LV3 is about one CPU's worth.
+# 5 cores (10 logical on SMT2) covers LV2's ~8.2 with headroom. 33 threads share
+# the set on purpose — they are preempted, not saturated (34% runnable).
+#
+# ⚠ Pair with a lower numa.reserve_cores_per_node when testing: BufferSync is a
+# foreground role and foreground_cores_per_node=0 makes both halves the full
+# engine set, so the carve-out is otherwise taken straight out of everyone else.
+lv2_dedicated_cores = 0

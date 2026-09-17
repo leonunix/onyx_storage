@@ -817,6 +817,14 @@ fn setup_confine(config: &crate::config::OnyxConfig) -> crate::error::OnyxResult
         foreground_cpus.clone(),
         background_cpus.clone(),
     );
+    // LV2 first: it is the larger claim, and `dedicate` only hands out cores
+    // still in the role's shared half, so the order decides who gets the
+    // contiguous block nearest the OS reserve when both are set.
+    budget.dedicate(
+        crate::affinity::ThreadRole::BufferSync,
+        &node.cores,
+        config.cores.lv2_dedicated_cores,
+    )?;
     budget.dedicate(
         crate::affinity::ThreadRole::Lv3Batch,
         &node.cores,

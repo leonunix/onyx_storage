@@ -100,14 +100,18 @@ pub struct CoresConfig {
     /// ⚠ Untested at RWMIX=0, which is the only load where the LV3 drain is
     /// the binding resource — so this verdict covers the mixed workload only.
     ///
-    /// ⚠ Sizing: there are `CHUNKLET_BATCH_EXECUTORS` = 6 executor threads, so
-    /// 3 physical cores (6 logical, on this box's SMT2) is one thread per
-    /// logical CPU. Fewer cores than that oversubscribes the dedicated set,
-    /// which defeats the point.
+    /// ⚠⚠ **3 was the WRONG SIZE, and the reasoning that picked it was wrong
+    /// too.** It came from "6 executor threads ⇒ 3 SMT2 cores ⇒ one thread per
+    /// logical CPU". But thread count is not demand: this group contributes
+    /// only **~1.0 mean runnable**, so 6 logical CPUs over-provisioned it ~6×
+    /// and the 5 idle CPUs came straight out of groups that were short. Size a
+    /// reservation from `mean runnable` — see `lv2_dedicated_cores` for the
+    /// rule and the numbers. The demand-sized value here is **1** core; it has
+    /// not been measured.
     ///
-    /// ⚠ The carve-out is taken from the *background* half, and the budget
-    /// refuses to leave that half empty — a value large enough to starve
-    /// everything else is a startup error, not a warning.
+    /// ⚠ The carve-out comes from the half this role shares (background for
+    /// LV3), and the budget refuses to leave either half empty — a value large
+    /// enough to starve everything else is a startup error, not a warning.
     ///
     /// ⚠ Interaction with `chunklet.pd_write_background_workers`: chunklet's
     /// background write-execution pool takes its CPUs from this same role
@@ -118,12 +122,55 @@ pub struct CoresConfig {
     /// only happens deliberately — but size it as one pool if you do.
     #[serde(default)]
     pub lv3_dedicated_cores: usize,
+    /// Physical cores for the LV2 commit-log sync threads
+    /// ([`crate::affinity::ThreadRole::BufferSync`] — the
+    /// `persistent-slot-sync-global` coordinator plus the per-shard prepare and
+    /// write-lane threads). `0` (default) keeps them in the shared foreground
+    /// set.
+    ///
+    /// ⭐ **SIZE THIS FROM `mean runnable`, NOT FROM THREAD COUNT.** Post-Phase-1
+    /// census (box 2026-09-16, QD256 j16d16 randrw 70/30, 44 confined cores,
+    /// memory `thread_starvation_confirmed_census`):
+    ///
+    /// ```text
+    /// group             threads  mean runnable  involuntary sw/s/thread
+    /// ublk-io-worker-        32     10.6-11.7              792-855
+    /// persistent-slot        33      7.9-8.6               611-655
+    /// read-pool-fg            6      3.4-3.7             1063-1170
+    /// lv3-batch-exec-         6      0.87                      48
+    /// ```
+    ///
+    /// LV2 is the **second-largest CPU consumer in the engine** and eats ~630
+    /// involuntary switches/s/thread, while LV3 — which got the first
+    /// reservation — consumes about one CPU's worth. 5 cores (10 logical on
+    /// SMT2) covers LV2's ~8.2 with headroom.
+    ///
+    /// ⚠ Unlike LV3 this is deliberately NOT one-thread-per-CPU: 33 threads
+    /// share the set. That is the point — they are *preempted*, not saturated
+    /// (34% runnable), so the reservation buys uninterrupted turns rather than
+    /// a private CPU each.
+    ///
+    /// ⚠ Do NOT "simplify" this by cutting `buffer.shards` or
+    /// `buffer.lv2_write_lanes` instead: lane width is load-bearing for append
+    /// p99 (`aaf9bd0` — 16 lanes vs 8 bought −39% `append_total` and −68%
+    /// `wait_durable` p99). The thread count is deliberate; this knob is about
+    /// the CPU underneath it.
+    ///
+    /// ⚠ BufferSync is a *foreground* role, so the cores come out of the
+    /// foreground half. With `numa.foreground_cores_per_node = 0` (the default)
+    /// both halves are the same full engine set, so in practice this takes from
+    /// everyone — which is why pairing it with a lower
+    /// `numa.reserve_cores_per_node` is worth testing: giving 1-2 cores back
+    /// from the OS reserve stops the reservation being purely zero-sum.
+    #[serde(default)]
+    pub lv2_dedicated_cores: usize,
 }
 
 impl Default for CoresConfig {
     fn default() -> Self {
         Self {
             lv3_dedicated_cores: 0,
+            lv2_dedicated_cores: 0,
         }
     }
 }
@@ -2918,18 +2965,32 @@ mod service_config_tests {
     fn cores_dedications_default_to_none() {
         let config: OnyxConfig = toml::from_str("").unwrap();
         assert_eq!(config.cores.lv3_dedicated_cores, 0);
+        assert_eq!(config.cores.lv2_dedicated_cores, 0);
     }
 
     #[test]
-    fn cores_lv3_dedicated_cores_deserializes() {
+    fn cores_dedicated_core_knobs_deserialize_independently() {
         let config: OnyxConfig = toml::from_str(
             r#"
                 [cores]
-                lv3_dedicated_cores = 3
+                lv3_dedicated_cores = 1
+                lv2_dedicated_cores = 5
             "#,
         )
         .unwrap();
-        assert_eq!(config.cores.lv3_dedicated_cores, 3);
+        assert_eq!(config.cores.lv3_dedicated_cores, 1);
+        assert_eq!(config.cores.lv2_dedicated_cores, 5);
+
+        // One set, the other still defaulted.
+        let only_lv2: OnyxConfig = toml::from_str(
+            r#"
+                [cores]
+                lv2_dedicated_cores = 5
+            "#,
+        )
+        .unwrap();
+        assert_eq!(only_lv2.cores.lv2_dedicated_cores, 5);
+        assert_eq!(only_lv2.cores.lv3_dedicated_cores, 0);
     }
 
     #[test]
