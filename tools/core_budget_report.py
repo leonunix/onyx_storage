@@ -210,12 +210,44 @@ def main(argv):
             "Do not claim a throughput magnitude."
         )
 
+    # ⭐ Handoff work per unit data, per group. This is the judge for any arm
+    # that changes a HOP's shape rather than a CPU mask: `nr_queues` 32 -> 8 cut
+    # `ublk-fio-volume` from 41,804 to 18,698 vol/s at constant IO because fewer
+    # queues mean deeper completion drains
+    # (memory `ublk_hop_chain_is_three_required_wakes`). Normalise per MiB or a
+    # throughput difference between arms reads as a handoff difference.
+    print()
+    print("-- vol/s per MiB per group (handoff work per unit data) --")
+    hop_groups = ["ublk-fio-volume", "ublk-io-worker-", "ublk-durable", "persistent-slot",
+                  "flusher-coalesc", "onyx-metadb-app", "read-pool-fg", "read-pool"]
+    first = order_keys[0]
+    others = order_keys[1:]
+    header = "%-18s %5s %9s" % ("group", "thr", labels[first][:9])
+    for a in others:
+        header += " %9s %7s" % (labels[a][:9], "delta")
+    print(header)
+
+    def per_mib(arm, group):
+        vals = [data[s]["rows"][group]["vol_s"] / data[s]["mib"]
+                for s in arms[arm] if group in data[s]["rows"] and data[s]["mib"]]
+        return sum(vals) / len(vals) if vals else float("nan")
+
+    def thr_of(arm, group):
+        vals = [data[s]["rows"][group]["thr"] for s in arms[arm] if group in data[s]["rows"]]
+        return sum(vals) / len(vals) if vals else float("nan")
+
+    for g in [x for x in hop_groups if any(x in data[s]["rows"] for s in segs)]:
+        base_v = per_mib(first, g)
+        line = "%-18s %5.0f %9.1f" % (g, thr_of(first, g), base_v)
+        for a in others:
+            v = per_mib(a, g)
+            line += " %9.1f %6.1f%%" % (v, (v - base_v) / base_v * 100 if base_v else float("nan"))
+        print(line)
+
     print()
     print("-- nv/thr/s per group (preemption), first arm vs each other arm --")
     names = list(dict.fromkeys(BUSY_GROUPS + FENCE_GROUPS + extra_groups))
-    first = order_keys[0]
     header = "%-18s %5s %9s" % ("group", "thr", labels[first][:9])
-    others = order_keys[1:]
     for a in others:
         header += " %9s %7s" % (labels[a][:9], "delta")
     print(header)

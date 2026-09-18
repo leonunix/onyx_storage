@@ -417,7 +417,23 @@ sync_batch_max_bytes_mb = 1024
 # (i.e. free, not a win), involuntary FLAT per unit work, errors 0.
 # ⚠ The arithmetic reason to expect MORE from this was falsified
 # (`ublk_nr_queues_8_vs_32_ab`); keep it as a thread cut, not a throughput lever.
-nr_queues = 8
+#
+# ⭐ 4, not 8, since 2026-09-18 (box p15, 6 restart-per-arm segments, 3 of them
+# baseline — memory `nr_queues_sweep_drain_depth_vs_completion_wait`). The
+# mechanism is the COMPLETION DRAIN and it is dose-responsive: completions per
+# eventfd wake 1.91 (three identical segments) -> 2.5 at 4 -> 3.03 at 2, and
+# `ublk-fio-volume` handoffs per MiB 21.3 -> 10.0 -> 5.1, i.e. 1/nr_queues.
+# Nothing else moved (io-worker 0.0%, durable +0.7%, LV2 +0.8%, apply_wait flat,
+# errors 0). Engine-wide voluntary switches per MiB -3.8% at 4.
+#
+# ⛔ 2 is measured and NOT shipped: it buys only 4.9 more vol/MiB (1.8% of the
+# engine total, against 11.3 for the 8->4 step) and it costs **+21% mean
+# `completion_wait`** (134.5 -> 162.4 us), because a completion then waits
+# longer for its queue thread's next drain. That is the concentration risk
+# showing up exactly where predicted. At 4 the same cost is +2..5%, i.e. noise.
+# Raise it only with a tail-latency measurement, which `status` cannot give
+# (`user_io_latency_ns` carries totals, not percentiles).
+nr_queues = 4
 queue_depth = 256
 io_buf_bytes = 1048576
 queue_workers = 4
