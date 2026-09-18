@@ -40,6 +40,23 @@
 #   WA metadb only     cores 0 0 2 3 metadb-apply,metaio
 #                                      96 threads @ 6.06 meanR; leaves
 #                                      flusher-writer on the LV3 submit path
+#   C  BOTH at once     cores 5 0 0 4   LV2 dedication + the wait fence together,
+#                                      on the Phase-1 (262-thread) baseline
+#
+# ⭐ WHY A COMBINED C ARM IS LEGITIMATE HERE (2026-09-18, 周工). The Phase-1
+# thread cuts (`nr_queues` 8, shared coalesce pool, `page_write_workers` 16) are
+# read at OPEN, so they are constant across every segment of this harness — they
+# are the BASELINE, not an arm. The only variable a segment changes is the CPU
+# budget, over IPC, inside one process. The attribution objection applies to
+# putting a dedication into the restart-per-arm thread-cut batch
+# (tools/thread_budget_ab.sh), not here.
+#
+# And the mechanism moved in the arm's favour: Phase 1 took ~3 mean-runnable
+# CPUs off the SHARED side (`ublk-fio-volume` alone went 6.78 -> 3.83), which is
+# about what a 5-core LV2 dedication strands as private idle capacity. Total
+# oversubscription 1.61x -> 1.54x. That does not flip the sign by arithmetic,
+# but it is the same order as the effects being chased, so it is measurable
+# rather than decidable.
 #
 # ⭐ WHY THE W ARMS EXIST. Every D-style arm gives cores to a BUSY role and all
 # of them lost: demand is 70.5 mean-runnable CPUs against 44, so a dedication
@@ -233,7 +250,8 @@ for seg in $SEGMENTS; do
         W5*) set_arm "$seg" 0 0 2 44 5 "$ALL_WAIT_GROUPS" ;;
         WA*) set_arm "$seg" 0 0 2 44 3 metadb-apply,metaio ;;
         W*)  set_arm "$seg" 0 0 2 44 4 "$ALL_WAIT_GROUPS" ;;
-        *)   echo "unknown segment $seg (must start with B, R, S, D, W, W5 or WA)" >&2; exit 2 ;;
+        C*)  set_arm "$seg" 5 0 0 48 4 "$ALL_WAIT_GROUPS" ;;
+        *)   echo "unknown segment $seg (must start with B, R, S, D, W, W5, WA or C)" >&2; exit 2 ;;
     esac
     # Let the enforcer converge every already-running thread onto the new masks
     # before anything is measured. Three sweeps.
