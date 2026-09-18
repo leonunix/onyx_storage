@@ -76,7 +76,12 @@ P=$(pgrep -nx onyx-storage) || { echo "FAIL: engine not running" >&2; exit 1; }
 # Prove confine is even active before burning 150 s: `cores` reports
 # "inactive" under any other layout, and every arm below would then be a
 # duplicate baseline.
-before=$("$B" -c "$CFG" cores 2>&1 | head -1)
+# ⚠ ANCHOR the match to the line start; do not take "the first line", and do
+# not match `reserved_cores=` unanchored. The CLI process runs its own numa
+# setup on startup and logs `numa confine active ... reserved_cores=2` for
+# ITSELF — on STDOUT, and that line contains `reserved_cores=` too. Only the
+# IPC reply begins with it.
+before=$("$B" -c "$CFG" cores 2>/dev/null | grep -m1 -E '^reserved_cores=|^error|^inactive')
 case "$before" in
     *inactive*|*error*)
         echo "FAIL: core budget not available — engine says: $before" >&2
@@ -94,7 +99,8 @@ esac
 set_arm() {
     local seg="$1" lv2="$2" lv3="$3" rsv="$4" want_cpus="$5"
     local got
-    got=$("$B" -c "$CFG" cores "$lv2" "$lv3" "$rsv" 2>&1 | head -1)
+    got=$("$B" -c "$CFG" cores "$lv2" "$lv3" "$rsv" 2>/dev/null \
+        | grep -m1 -E '^reserved_cores=|^error|^inactive')
     echo "arm $seg: requested lv2=$lv2 lv3=$lv3 reserve=$rsv -> $got" | tee -a "$OUT/plan"
     case "$got" in
         *"engine_cpus=$want_cpus"*) : ;;
