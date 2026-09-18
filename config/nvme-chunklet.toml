@@ -139,6 +139,16 @@ group_commit_timeout_us = 1
 dedup_shards = 8
 dedup_cuckoo_buckets = 64000000
 dedup_l1_cache_entries = 256000
+# `metaio-*` page-write pool: 16, down from the compiled 32. Census 2026-09-18
+# (/root/p1/p12) measured it at 2.41 mean runnable / maxR 20 / 7.5% duty over 32
+# threads -- the second-largest wait-class group in the engine.
+# ⚠ This is the checkpoint's DEVICE parallelism (one io_uring per worker, <=1 MiB
+# per ticket), and a metadb checkpoint is the only thing that releases LV2 ring
+# space, so it lands on foreground append latency before it lands on CPU. 16 sits
+# at the measured peak of 20; going lower trades checkpoint parallelism for
+# threads and needs its own arm judged on `metadb_commit.total_us` + the release
+# cadence (tools/checkpoint_delta.py), NOT on thread count.
+page_write_workers = 16
 l2p_buffer_enabled = true
 # Global L2P-mutation budget per Open BFG. The historical 64k default rolled a
 # BFG (and forced a checkpoint) every 64k mutations, causing a checkpoint storm.
@@ -399,7 +409,15 @@ sync_batch_max_entries = 131072
 sync_batch_max_bytes_mb = 1024
 
 [ublk]
-nr_queues = 32
+# 8, not 32: each queue costs one `ublk-fio-volume` daemon thread, and since the
+# shared io-worker pool landed (086a47a) that is ALL a queue costs -- the 32
+# `ublk-io-worker` threads are a separate pool and keep their size. Measured
+# 2026-09-18 over 4 bracketed arms (memory `combined_screen_nrq8_plus_coalesce_pool`):
+# `ublk-fio-volume` 33 -> 9 threads, throughput +1.78% on a 1.57% baseline spread
+# (i.e. free, not a win), involuntary FLAT per unit work, errors 0.
+# ⚠ The arithmetic reason to expect MORE from this was falsified
+# (`ublk_nr_queues_8_vs_32_ab`); keep it as a thread cut, not a throughput lever.
+nr_queues = 8
 queue_depth = 256
 io_buf_bytes = 1048576
 queue_workers = 4
@@ -467,6 +485,11 @@ io_workers = 32
 #   dedup     16 x 2 = 32  ->  8
 shared_compress_pool = true
 shared_cleanup_pool = true
+# Same treatment for the admission stage: 16 per-shard coalescers -> a pool of 8
+# that CLAIM shards (`9cdae6a`). Fairness is structural (one shared rotation
+# counter), so no shard can be starved by a busy neighbour. Measured free in the
+# same 4-arm bracket as nr_queues above; `flusher-coalesc` 16 -> 8 threads.
+shared_coalesce_pool = true
 compress_workers = 2
 # Coalesce to exactly ONE RAID6 stripe (6 × 4 KiB = 24 KiB). A full coalesce
 # unit is then a stripe multiple, so `raid_full_stripe_writes` can align it and

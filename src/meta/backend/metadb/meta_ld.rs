@@ -57,7 +57,24 @@ const MAX_DEVICE_WRITE_BYTES: usize = 1024 * 1024;
 /// Chunklet's io_uring backend owns one ring per worker, so this also bounds
 /// rings used by split page writes; small single-ticket writes retain their
 /// latency-oriented caller fast path.
+///
+/// Overridable with `meta.page_write_workers` — see that knob for why the size
+/// is a checkpoint-latency decision rather than a CPU one.
 const MAX_PARALLEL_DEVICE_WRITES: usize = 32;
+/// Upper bound on `meta.page_write_workers`. Each worker is an io_uring, so a
+/// fat-fingered value costs kernel memory and file descriptors, not just
+/// threads.
+const MAX_CONFIGURED_PAGE_WRITE_WORKERS: usize = 256;
+
+/// Resolve `meta.page_write_workers`: `0` = compiled default, anything else
+/// clamped into `1..=MAX_CONFIGURED_PAGE_WRITE_WORKERS`.
+fn page_write_workers(configured: usize) -> usize {
+    match configured {
+        0 => MAX_PARALLEL_DEVICE_WRITES,
+        n => n.min(MAX_CONFIGURED_PAGE_WRITE_WORKERS),
+    }
+}
+
 /// Volume-catalog A/B slot header: `generation(8) | payload_len(4) | crc32(4)`.
 const CATALOG_SLOT_HEADER: usize = 16;
 
@@ -201,9 +218,10 @@ struct MetaWindow {
 }
 
 impl MetaWindow {
-    fn new(slice: BackendSlice) -> OnyxResult<Self> {
+    /// `workers` is already resolved by [`page_write_workers`].
+    fn new(slice: BackendSlice, workers: usize) -> OnyxResult<Self> {
         let write_pool = ThreadPoolBuilder::new()
-            .num_threads(MAX_PARALLEL_DEVICE_WRITES)
+            .num_threads(workers)
             .thread_name(|idx| format!("metaio-{idx}"))
             .start_handler(|idx| {
                 crate::affinity::bind_current(crate::affinity::ThreadRole::MetadbCheckpoint, idx)
@@ -574,6 +592,7 @@ struct MetaDeviceParts {
 fn open_device_parts(
     backend: &Arc<ChunkletBackend>,
     create_if_missing: bool,
+    page_write_workers: usize,
 ) -> OnyxResult<MetaDeviceParts> {
     let capacity = backend.size();
     if capacity < JOURNAL_OFF + MIN_JOURNAL_BYTES + SB_BYTES {
@@ -611,7 +630,7 @@ fn open_device_parts(
     let backend_dyn: Arc<dyn BlockBackend> = backend.clone();
     let pages_slice = BackendSlice::new(backend_dyn.clone(), sb.pages_off, sb.pages_bytes)?;
     let journal_slice = BackendSlice::new(backend_dyn.clone(), sb.journal_off, sb.journal_bytes)?;
-    let page_io: Arc<dyn PageBlockIo> = Arc::new(MetaWindow::new(pages_slice)?);
+    let page_io: Arc<dyn PageBlockIo> = Arc::new(MetaWindow::new(pages_slice, page_write_workers)?);
     let page_device: Arc<dyn PageDevice> =
         Arc::new(BlockPageDevice::new(page_io).map_err(onyx_err)?);
     let journal_device: Arc<dyn JournalDevice> = Arc::new(JournalWindow::new(journal_slice));
@@ -632,8 +651,15 @@ fn open_device_parts(
 pub(super) fn open_or_create(
     backend: Arc<ChunkletBackend>,
     db_config: MetaDbConfig,
+    configured_page_write_workers: usize,
 ) -> OnyxResult<MetaLd> {
-    let parts = open_device_parts(&backend, true)?;
+    let workers = page_write_workers(configured_page_write_workers);
+    tracing::info!(
+        page_write_workers = workers,
+        configured = configured_page_write_workers,
+        "metadb meta-LD page-write pool sized"
+    );
+    let parts = open_device_parts(&backend, true, workers)?;
 
     let db = if parts.fresh {
         Db::create_on_device(db_config, parts.page_device, parts.journal_device)
@@ -668,12 +694,17 @@ pub(super) fn open_or_create(
 pub(super) fn open_for_offline_audit(
     backend: Arc<ChunkletBackend>,
     mut db_config: MetaDbConfig,
+    configured_page_write_workers: usize,
 ) -> OnyxResult<Arc<Db>> {
     // Defend this lowest audit-only entry point as well as its current callers:
     // a future tool cannot accidentally pass production background-worker
     // settings and mutate the store for the lifetime of a point query.
     super::sanitize_offline_audit_config(&mut db_config);
-    let parts = open_device_parts(&backend, false)?;
+    let parts = open_device_parts(
+        &backend,
+        false,
+        page_write_workers(configured_page_write_workers),
+    )?;
     debug_assert!(
         !parts.fresh,
         "open_device_parts(create_if_missing=false) never returns fresh"
@@ -754,6 +785,59 @@ mod tests {
         }
     }
 
+    /// `meta.page_write_workers` is not a cosmetic thread count: it IS the
+    /// checkpoint's device parallelism, so the knob has to show up as a bound
+    /// on concurrent backend calls. A test that only counted threads would pass
+    /// even if the pool size stopped reaching the IO path.
+    #[test]
+    fn configured_page_write_workers_bound_device_parallelism() {
+        const PAGE_BYTES: usize = 4096;
+        const WORKERS: usize = 4;
+        // Enough batches that a 32-wide pool would obviously exceed 4.
+        const BATCH_COUNT: usize = MAX_PARALLEL_DEVICE_WRITES + 2;
+
+        let page_count = BATCH_COUNT * (MAX_DEVICE_WRITE_BYTES / PAGE_BYTES);
+        let backend_size = (page_count * PAGE_BYTES) as u64;
+        let backend = Arc::new(RecordingBackend::new(backend_size));
+        let backend_dyn: Arc<dyn BlockBackend> = backend.clone();
+        let window = MetaWindow::new(
+            BackendSlice::new(backend_dyn, 0, backend.size).unwrap(),
+            WORKERS,
+        )
+        .unwrap();
+        let page = [0xC3; PAGE_BYTES];
+        let ops: Vec<(u64, &[u8])> = (0..page_count)
+            .map(|idx| ((idx * PAGE_BYTES) as u64, page.as_slice()))
+            .collect();
+
+        window.write_many_at(&ops).unwrap();
+
+        assert_eq!(
+            backend.calls.load(Ordering::Relaxed),
+            BATCH_COUNT,
+            "every batch must still execute exactly once"
+        );
+        let max_in_flight = backend.max_in_flight.load(Ordering::Relaxed);
+        assert!(max_in_flight > 1, "a 4-worker pool must still overlap");
+        assert!(
+            max_in_flight <= WORKERS,
+            "configured pool of {WORKERS} let {max_in_flight} writes overlap"
+        );
+    }
+
+    /// `0` means "compiled default", and an absurd value is clamped rather than
+    /// turned into that many io_urings.
+    #[test]
+    fn page_write_worker_count_resolves_zero_and_clamps() {
+        assert_eq!(page_write_workers(0), MAX_PARALLEL_DEVICE_WRITES);
+        assert_eq!(page_write_workers(16), 16);
+        assert_eq!(page_write_workers(1), 1);
+        assert_eq!(
+            page_write_workers(usize::MAX),
+            MAX_CONFIGURED_PAGE_WRITE_WORKERS
+        );
+    }
+
     #[test]
     fn checkpoint_page_batches_are_written_with_bounded_parallelism() {
         const PAGE_BYTES: usize = 4096;
@@ -763,8 +847,11 @@ mod tests {
         let backend_size = (page_count * PAGE_BYTES) as u64;
         let backend = Arc::new(RecordingBackend::new(backend_size));
         let backend_dyn: Arc<dyn BlockBackend> = backend.clone();
-        let window =
-            MetaWindow::new(BackendSlice::new(backend_dyn, 0, backend.size).unwrap()).unwrap();
+        let window = MetaWindow::new(
+            BackendSlice::new(backend_dyn, 0, backend.size).unwrap(),
+            MAX_PARALLEL_DEVICE_WRITES,
+        )
+        .unwrap();
         let page = [0xA5; PAGE_BYTES];
         let ops: Vec<(u64, &[u8])> = (0..page_count)
             .map(|idx| ((idx * PAGE_BYTES) as u64, page.as_slice()))
@@ -792,7 +879,11 @@ mod tests {
         let backend = Arc::new(RecordingBackend::new(backend_size));
         let backend_dyn: Arc<dyn BlockBackend> = backend.clone();
         let window = Arc::new(
-            MetaWindow::new(BackendSlice::new(backend_dyn, 0, backend.size).unwrap()).unwrap(),
+            MetaWindow::new(
+                BackendSlice::new(backend_dyn, 0, backend.size).unwrap(),
+                MAX_PARALLEL_DEVICE_WRITES,
+            )
+            .unwrap(),
         );
         let page = [0x5A; PAGE_BYTES];
         let ops: Vec<(u64, &[u8])> = (0..page_count)
@@ -829,8 +920,11 @@ mod tests {
         let backend_size = (page_count * PAGE_BYTES) as u64;
         let backend = Arc::new(RecordingBackend::failing(backend_size, 1));
         let backend_dyn: Arc<dyn BlockBackend> = backend.clone();
-        let window =
-            MetaWindow::new(BackendSlice::new(backend_dyn, 0, backend.size).unwrap()).unwrap();
+        let window = MetaWindow::new(
+            BackendSlice::new(backend_dyn, 0, backend.size).unwrap(),
+            MAX_PARALLEL_DEVICE_WRITES,
+        )
+        .unwrap();
         let page = [0xC3; PAGE_BYTES];
         let ops: Vec<(u64, &[u8])> = (0..page_count)
             .map(|idx| ((idx * PAGE_BYTES) as u64, page.as_slice()))

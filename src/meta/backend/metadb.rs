@@ -327,7 +327,7 @@ impl MetadbBackend {
             .cloned()
             .unwrap_or_else(|| PathBuf::from("<meta-ld>"));
         let db_config = metadb_config_from_onyx(&label, config);
-        let meta_ld = meta_ld::open_or_create(meta_backend, db_config)?;
+        let meta_ld = meta_ld::open_or_create(meta_backend, db_config, config.page_write_workers)?;
         Self::assemble(
             config,
             meta_ld.db,
@@ -2586,7 +2586,7 @@ fn open_meta_ld_for_offline_audit(
         .cloned()
         .unwrap_or_else(|| PathBuf::from("<meta-ld>"));
     let db_config = metadb_config_for_offline_audit(&label, config);
-    meta_ld::open_for_offline_audit(meta_backend, db_config)
+    meta_ld::open_for_offline_audit(meta_backend, db_config, config.page_write_workers)
 }
 
 fn metadb_config_for_offline_audit(path: &Path, config: &MetaConfig) -> MetaDbConfig {

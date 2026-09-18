@@ -4,11 +4,19 @@
 #
 #   thread_budget_ab.sh <tag> [config] [arms...]
 #
-#   arm = <io_workers>:<read_pool_workers>[:<lv3_cores>[:<lv2_cores>[:<reserve_cores>[:<nr_queues>[:<coalesce_drivers>]]]]]
-#         Trailing fields are optional and default to the shipped values
-#         (lv3=0, lv2=0, reserve=2, nr_queues=32, coalesce_drivers=0), so the
-#         shorter arms recorded in memory `thread_budget_io_readpool_ab` /
-#         `lv3_dedicated_cores_zero_sum` still mean what they meant.
+#   arm = <io_workers>:<read_pool_workers>[:<lv3_cores>[:<lv2_cores>[:<reserve_cores>[:<nr_queues>[:<coalesce_drivers>[:<page_write_workers>]]]]]]
+#         Trailing fields are optional and default to the PRE-2026-09-18 shipped
+#         values (lv3=0, lv2=0, reserve=2, nr_queues=32, coalesce_drivers=0,
+#         page_write_workers=0=compiled 32), so the shorter arms recorded in
+#         memory `thread_budget_io_readpool_ab` / `lv3_dedicated_cores_zero_sum`
+#         still mean what they meant. ⚠ The config now SHIPS the cut values, so
+#         a baseline arm has to state the old ones explicitly.
+#
+#   page_write_workers is `meta.page_write_workers`, the `metaio-*` pool (32
+#   threads at 0/default, 2.41 meanR / maxR 20 / 7.5% duty on the box). ⚠ It is
+#   the checkpoint's DEVICE parallelism -- one io_uring per worker -- and a
+#   metadb checkpoint is the only thing that releases LV2 ring space, so judge
+#   it on `metadb_commit.total_us` + release cadence before thread count.
 #
 #   coalesce_drivers is `flush.coalesce_pool_workers`; 0 leaves
 #   `shared_coalesce_pool` OFF (one dedicated admission thread per shard).
@@ -133,10 +141,10 @@ set_knob() {
 IDX=0
 for arm_spec in $ARMS; do
     IDX=$((IDX + 1))
-    IFS=: read -r io rp lv3 lv2 rsv nrq cpool <<<"$arm_spec"
-    lv3=${lv3:-0}; lv2=${lv2:-0}; rsv=${rsv:-2}; nrq=${nrq:-32}; cpool=${cpool:-0}
-    arm="$IDX.io$io-rp$rp-lv3$lv3-lv2$lv2-rsv$rsv-nrq$nrq-cp$cpool"
-    echo "=== arm $arm (io_workers=$io read_pool_workers=$rp lv3_cores=$lv3 lv2_cores=$lv2 reserve_cores=$rsv nr_queues=$nrq coalesce_drivers=$cpool)  $(date -Is) ===" \
+    IFS=: read -r io rp lv3 lv2 rsv nrq cpool pww <<<"$arm_spec"
+    lv3=${lv3:-0}; lv2=${lv2:-0}; rsv=${rsv:-2}; nrq=${nrq:-32}; cpool=${cpool:-0}; pww=${pww:-0}
+    arm="$IDX.io$io-rp$rp-lv3$lv3-lv2$lv2-rsv$rsv-nrq$nrq-cp$cpool-pww$pww"
+    echo "=== arm $arm (io_workers=$io read_pool_workers=$rp lv3_cores=$lv3 lv2_cores=$lv2 reserve_cores=$rsv nr_queues=$nrq coalesce_drivers=$cpool page_write_workers=$pww)  $(date -Is) ===" \
         | tee -a "$OUT/plan"
     if [ "$nrq" != "32" ] && [ "$io" = "0" ]; then
         echo "FAIL: arm $arm moves nr_queues with io_workers=0, so io_workers would move too" >&2
@@ -155,6 +163,7 @@ for arm_spec in $ARMS; do
     set_knob lv2_dedicated_cores "$lv2" cores | tee -a "$OUT/plan"
     set_knob reserve_cores_per_node "$rsv" numa | tee -a "$OUT/plan"
     set_knob nr_queues "$nrq" ublk | tee -a "$OUT/plan"
+    set_knob page_write_workers "$pww" meta | tee -a "$OUT/plan"
     if [ "$cpool" = "0" ]; then
         set_knob shared_coalesce_pool false flush | tee -a "$OUT/plan"
         set_knob coalesce_pool_workers 0 flush | tee -a "$OUT/plan"
@@ -221,6 +230,22 @@ for arm_spec in $ARMS; do
         echo "FAIL: arm $arm asked coalesce_drivers=$cpool but engine started ${eff_cpool:-off}" >&2
         exit 1
     fi
+    # The page-write pool logs its resolved size at open, so `0` proves itself
+    # as the compiled 32 rather than as "absent".
+    eff_pww=$(sed -E 's/\x1b\[[0-9;]*m//g' "$OUT/engine.$arm.log" \
+        | grep -m1 'metadb meta-LD page-write pool sized' \
+        | grep -oE 'page_write_workers=[0-9]+' | head -1 | cut -d= -f2)
+    want_pww=$pww
+    [ "$pww" = "0" ] && want_pww=32
+    echo "effective: page_write_workers=${eff_pww:-none} (want $want_pww)" | tee -a "$OUT/plan"
+    if [ -z "$eff_pww" ]; then
+        echo "FAIL: arm $arm found no page-write pool line -- the box binary predates meta.page_write_workers; rebuild it" >&2
+        exit 1
+    fi
+    if [ "$eff_pww" != "$want_pww" ]; then
+        echo "FAIL: arm $arm asked page_write_workers=$want_pww but engine started $eff_pww" >&2
+        exit 1
+    fi
     if [ -n "$eff_rp" ] && [ "$eff_rp" != "$rp" ]; then
         echo "FAIL: arm $arm asked read_pool_workers=$rp but engine started $eff_rp" >&2
         exit 1
@@ -284,16 +309,21 @@ for arm_spec in $ARMS; do
 done
 
 pkill -x fio 2>/dev/null
-# Restore what the repo ships so a later run does not inherit the last arm.
-# ⚠ io_workers / read_pool_workers are now COMMITTED at 32 / 12 (they earned
-# it — memory `thread_budget_io_readpool_ab`), so restore those values, not the
-# pre-Phase-1 defaults. lv3_dedicated_cores ships at 0.
+# Restore what the repo SHIPS so a later run does not inherit the last arm.
+# ⚠ Keep this list in sync with config/nvme-chunklet.toml whenever a cut earns
+# its way in — a stale restore silently leaves the box on an older baseline.
+# Committed cuts so far: io_workers 32 + read_pool_workers 12 (memory
+# `thread_budget_io_readpool_ab`), nr_queues 8 + the shared coalesce pool
+# (`combined_screen_nrq8_plus_coalesce_pool`), page_write_workers 16. Every
+# `cores.*` dedication ships at 0 (both directions measured, both lose).
 set_knob io_workers 32 ublk | tee -a "$OUT/plan"
 set_knob read_pool_workers 12 storage | tee -a "$OUT/plan"
 set_knob lv3_dedicated_cores 0 cores | tee -a "$OUT/plan"
 set_knob lv2_dedicated_cores 0 cores | tee -a "$OUT/plan"
+set_knob wait_class_cores 0 cores | tee -a "$OUT/plan"
 set_knob reserve_cores_per_node 2 numa | tee -a "$OUT/plan"
-set_knob nr_queues 32 ublk | tee -a "$OUT/plan"
-set_knob shared_coalesce_pool false flush | tee -a "$OUT/plan"
+set_knob nr_queues 8 ublk | tee -a "$OUT/plan"
+set_knob shared_coalesce_pool true flush | tee -a "$OUT/plan"
 set_knob coalesce_pool_workers 0 flush | tee -a "$OUT/plan"
+set_knob page_write_workers 16 meta | tee -a "$OUT/plan"
 echo "done — knobs restored to the shipped values. Compare $OUT/census.* ."

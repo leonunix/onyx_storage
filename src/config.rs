@@ -705,6 +705,25 @@ pub struct MetaConfig {
     /// Entries in metadb's in-memory dedup L1 hot cache.
     #[serde(default = "default_metadb_dedup_l1_cache_entries")]
     pub dedup_l1_cache_entries: usize,
+    /// Threads in the `metaio-*` page-write pool that serves every concurrent
+    /// L2P/RC caller on a chunklet meta LD (`backend = "chunklet"`).
+    /// `0` keeps the compiled default (32).
+    ///
+    /// ⚠ This is a CONCURRENCY pool, not a compute pool: each worker owns one
+    /// chunklet io_uring and takes one ≤1 MiB page-write ticket, so its size is
+    /// the checkpoint's **device parallelism** — and a metadb checkpoint is the
+    /// only thing that releases LV2 ring space
+    /// ([[checkpoint_cost_is_the_lv2_ring_governor]]). Shrinking it therefore
+    /// lands on foreground append latency long before it lands on CPU.
+    ///
+    /// Box census 2026-09-18 (`/root/p1/p12`): 32 threads, **2.41 mean
+    /// runnable, maxR 20, 7.5% duty** — the second-largest wait-class group in
+    /// the engine. 20 is its measured peak, so 16 is the demand-sized cut and
+    /// anything below that is trading checkpoint parallelism for threads.
+    /// ⛔ Judge a change on `metadb_commit.total_us` and the checkpoint release
+    /// cadence (`tools/checkpoint_delta.py`), NOT on thread count.
+    #[serde(default)]
+    pub page_write_workers: usize,
     /// Enable metadb's background refcount drainer. Default **on**
     /// (Tier 1.A, `/root/.claude/plans/ticklish-sparking-barto.md`):
     /// the drainer absorbs `RcShard.delta_active` into a sealed-page
@@ -1003,6 +1022,7 @@ impl Default for MetaConfig {
             shards_per_partition: default_metadb_shards_per_partition(),
             dedup_cuckoo_buckets: default_metadb_dedup_cuckoo_buckets(),
             dedup_l1_cache_entries: default_metadb_dedup_l1_cache_entries(),
+            page_write_workers: 0,
             refcount_drainer_enabled: default_refcount_drainer_enabled(),
             refcount_drainer_interval_ms: default_refcount_drainer_interval_ms(),
             refcount_drainer_threshold_entries: default_refcount_drainer_threshold_entries(),
