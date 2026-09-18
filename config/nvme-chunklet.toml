@@ -106,9 +106,9 @@ lv2 = { raid = "raid10", set_size = 2, row_size = 2, num_rows = 6, strip_kib = 0
 # taking metadb down (the SPOF that /mnt/onyx-meta XFS used to be).
 meta = { raid = "raid10", set_size = 2, row_size = 2, num_rows = 32, strip_kib = 0 }
 # Filled in after `chunklet-init --force` (Phase 3f re-init, 10 PDs, meta LD 64GiB):
-lv3_ld_id = "3c569e4d-7f28-40f7-94d4-81b6be237078"
-lv2_ld_id = "ec0ac362-1321-41f8-a761-d12f1fcfb49b"
-meta_ld_id = "e7c1cfd9-9a8c-4027-8097-2770e9605eee"
+lv3_ld_id = "f77d3014-53b9-4caf-85a3-f6890697e050"
+lv2_ld_id = "17459f56-9b43-439f-9e77-5caa9304c7ad"
+meta_ld_id = "1766d54f-f546-4390-94b6-09f650f63858"
 # Stripe-lock key grouping for the LV2 LD ONLY: chunklet hashes `key >> shift`,
 # so 10 collapses 1024 contiguous 4 KiB keys (4 MiB) onto one lock bucket, and
 # a ~512-key mirror write stops holding ~512 of the 65536 buckets for the whole

@@ -244,6 +244,24 @@ enum Command {
         /// New window in SQEs; omit to just read the current one.
         sqes: Option<usize>,
     },
+    /// Read or set the confine CPU budget on a RUNNING engine.
+    ///
+    /// Rebuilds `[cores] lv2_dedicated_cores` / `lv3_dedicated_cores` and
+    /// `[numa] reserve_cores_per_node` without a restart, so a core-budget A/B
+    /// keeps its arms in ONE process at ONE pool age instead of paying ~330 s
+    /// of restart + burn per arm. Existing threads are re-pinned by the
+    /// stray-thread enforcer within two 5 s sweeps — ⚠ wait ~10 s after a flip
+    /// before opening a measurement window (tools/core_budget_ab.sh does).
+    ///
+    /// All three arguments together, or none to just read what is in force.
+    Cores {
+        /// Physical cores dedicated to the LV2 sync threads.
+        lv2: Option<usize>,
+        /// Physical cores dedicated to the LV3 batch executors.
+        lv3: Option<usize>,
+        /// Physical cores withheld per node for the OS / IRQs.
+        reserve: Option<usize>,
+    },
     /// Read or set chunklet's RAID6 pipelined writer (`raid6_pipeline_window_stripes`).
     ///
     /// `0` is the two-phase writer: compute EVERY stripe's syndrome, then submit
@@ -1403,6 +1421,26 @@ fn main() -> anyhow::Result<()> {
             let cmd = match sqes {
                 Some(n) => format!("uring-window {n}"),
                 None => "uring-window".to_string(),
+            };
+            for line in service::send_chunklet_command(sock, &cmd)? {
+                println!("{line}");
+            }
+        }
+        Command::Cores { lv2, lv3, reserve } => {
+            let sock = &config.service.socket_path;
+            if !sock.exists() {
+                anyhow::bail!(
+                    "cores talks to a running engine (socket {:?} not found) — \
+                     start it first",
+                    sock
+                );
+            }
+            let cmd = match (lv2, lv3, reserve) {
+                (None, None, None) => "cores".to_string(),
+                (Some(a), Some(b), Some(c)) => format!("cores {a} {b} {c}"),
+                _ => anyhow::bail!(
+                    "cores takes all three arguments (<lv2> <lv3> <reserve>) or none"
+                ),
             };
             for line in service::send_chunklet_command(sock, &cmd)? {
                 println!("{line}");

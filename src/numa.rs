@@ -809,46 +809,189 @@ fn setup_confine(config: &crate::config::OnyxConfig) -> crate::error::OnyxResult
             "failed to confine main thread to node {home} background cpus {background_cpus:?}: {err}"
         )));
     }
+    let build = build_confine_budget(
+        config,
+        config.cores.lv2_dedicated_cores,
+        config.cores.lv3_dedicated_cores,
+        config.numa.reserve_cores_per_node,
+    )?;
+    build.log("numa confine active (in-engine numactl equivalent; ublk queue threads included)");
+    crate::affinity::init_confine(build.budget);
+    // Snapshot for the runtime `cores` rebuild; see CONFINE_CONFIG.
+    let _ = CONFINE_CONFIG.set(config.clone());
+    CONFINE_RESERVED_CORES.store(
+        config.numa.reserve_cores_per_node,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    spawn_confine_enforcer(None);
+    Ok(())
+}
+
+/// A freshly derived confine core budget plus the context needed to log it.
+pub(crate) struct ConfineBudgetBuild {
+    pub budget: crate::affinity::CoreBudget,
+    home: usize,
+    engine_cpus: Vec<usize>,
+    direct_io_cpus: Vec<usize>,
+    reserved_cores: usize,
+}
+
+impl ConfineBudgetBuild {
+    fn log(&self, msg: &'static str) {
+        let dedications: Vec<(String, Vec<usize>)> = self
+            .budget
+            .dedications()
+            .into_iter()
+            .map(|(role, role_cpus)| (format!("{role:?}"), role_cpus.to_vec()))
+            .collect();
+        tracing::info!(
+            home_node = self.home,
+            engine_cpus = ?self.engine_cpus,
+            foreground_cpus = ?self.budget.foreground_cpus(),
+            background_cpus = ?self.budget.background_cpus(),
+            dedicated = ?dedications,
+            direct_io_cpus = ?self.direct_io_cpus,
+            reserved_cores = self.reserved_cores,
+            "{}",
+            msg
+        );
+    }
+
+    /// One line an A/B arm can grep to prove what the engine actually applied,
+    /// in the shape the IPC caller echoes back.
+    pub(crate) fn summary(&self) -> String {
+        let dedications: Vec<String> = self
+            .budget
+            .dedications()
+            .into_iter()
+            .map(|(role, role_cpus)| format!("{role:?}={role_cpus:?}"))
+            .collect();
+        format!(
+            "reserved_cores={} engine_cpus={} dedicated=[{}]",
+            self.reserved_cores,
+            self.engine_cpus.len(),
+            dedications.join(",")
+        )
+    }
+}
+
+/// Derive a confine core budget from the live topology.
+///
+/// Split out of [`setup_confine`] so the runtime `cores` IPC command can
+/// rebuild a budget with different dedications without re-running any of the
+/// rest of confine setup. ⛔ Deliberately excludes the MEMORY plan
+/// (`plan_confine`, `set_thread_bind_node`, `cold_cache_policy`): those are
+/// about node capacity, not core counts, and re-applying mempolicy to a live
+/// engine is not something an A/B arm should do.
+pub(crate) fn build_confine_budget(
+    config: &crate::config::OnyxConfig,
+    lv2_cores: usize,
+    lv3_cores: usize,
+    reserve_cores: usize,
+) -> crate::error::OnyxResult<ConfineBudgetBuild> {
+    let topo = NumaTopology::detect();
+    let home = config.numa.home_node;
+    let Some(node) = topo.node(home) else {
+        return Err(crate::error::OnyxError::Config(format!(
+            "numa.home_node = {home} not present (detected nodes: {:?})",
+            topo.nodes.iter().map(|n| n.id).collect::<Vec<_>>()
+        )));
+    };
+    let direct_io_cpus = direct_io_cpus_for_topology(config, &topo)?;
+    let engine_cpus = node.engine_cpus(reserve_cores);
+    let (foreground_cpus, background_cpus) =
+        node.confine_cpu_sets(reserve_cores, config.numa.foreground_cores_per_node);
+    let background_cpus = exclude_direct_io_cpus(background_cpus, &direct_io_cpus, "background")?;
     // The budget is the single answer to "which CPUs may this role use" —
     // `bind_current` and the stray-thread enforcer both resolve through it, so
     // a dedicated carve-out cannot be silently widened again by the sweep.
-    let mut budget = crate::affinity::CoreBudget::new(
-        cpus.clone(),
-        foreground_cpus.clone(),
-        background_cpus.clone(),
-    );
+    let mut budget =
+        crate::affinity::CoreBudget::new(engine_cpus.clone(), foreground_cpus, background_cpus);
     // LV2 first: it is the larger claim, and `dedicate` only hands out cores
     // still in the role's shared half, so the order decides who gets the
     // contiguous block nearest the OS reserve when both are set.
-    budget.dedicate(
-        crate::affinity::ThreadRole::BufferSync,
-        &node.cores,
-        config.cores.lv2_dedicated_cores,
-    )?;
-    budget.dedicate(
-        crate::affinity::ThreadRole::Lv3Batch,
-        &node.cores,
-        config.cores.lv3_dedicated_cores,
-    )?;
-    let dedications: Vec<(String, Vec<usize>)> = budget
-        .dedications()
-        .into_iter()
-        .map(|(role, role_cpus)| (format!("{role:?}"), role_cpus.to_vec()))
-        .collect();
-    tracing::info!(
-        home_node = home,
-        engine_cpus = ?cpus,
-        foreground_cpus = ?budget.foreground_cpus(),
-        background_cpus = ?budget.background_cpus(),
-        dedicated = ?dedications,
-        direct_io_cpus = ?direct_io_cpus,
-        reserved_cores = config.numa.reserve_cores_per_node,
-        "numa confine active (in-engine numactl equivalent; ublk queue \
-         threads included)"
-    );
-    crate::affinity::init_confine(budget);
-    spawn_confine_enforcer(None);
-    Ok(())
+    budget.dedicate(crate::affinity::ThreadRole::BufferSync, &node.cores, lv2_cores)?;
+    budget.dedicate(crate::affinity::ThreadRole::Lv3Batch, &node.cores, lv3_cores)?;
+    Ok(ConfineBudgetBuild {
+        budget,
+        home,
+        engine_cpus,
+        direct_io_cpus,
+        reserved_cores: reserve_cores,
+    })
+}
+
+/// The config confine was set up with.
+///
+/// Deliberately a snapshot taken at startup rather than a re-read: the
+/// restart-per-arm harness REWRITES the config on disk, so a runtime rebuild
+/// that re-read the file could silently pick up a later arm's values. The only
+/// things an arm may change at runtime are the three parameters passed
+/// explicitly to [`apply_confine_budget`].
+static CONFINE_CONFIG: std::sync::OnceLock<crate::config::OnyxConfig> = std::sync::OnceLock::new();
+
+/// The reserve count behind the budget currently in force. The budget itself
+/// only knows which CPUs it got, not how many cores were withheld to produce
+/// them, and an A/B arm needs to prove the reserve it asked for.
+static CONFINE_RESERVED_CORES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// One line describing the budget actually in force, for an arm to self-prove
+/// against. Reads the LIVE budget rather than re-deriving one, so it cannot
+/// agree with a request that failed to apply.
+pub(crate) fn confine_budget_summary() -> String {
+    crate::affinity::with_confine_budget(|budget| match budget {
+        None => "inactive (numa.mode is not \"confine\")".to_string(),
+        Some(budget) => {
+            let dedications: Vec<String> = budget
+                .dedications()
+                .into_iter()
+                .map(|(role, cpus)| format!("{role:?}={cpus:?}"))
+                .collect();
+            format!(
+                "reserved_cores={} engine_cpus={} dedicated=[{}]",
+                CONFINE_RESERVED_CORES.load(std::sync::atomic::Ordering::Relaxed),
+                budget.engine_cpus().len(),
+                dedications.join(",")
+            )
+        }
+    })
+}
+
+/// Apply a new core budget to the running engine (the `cores` IPC command).
+///
+/// Existing threads are re-pinned by [`sweep_stray_threads`] within two 5 s
+/// sweeps — its test is exact set equality, so this converges whether the new
+/// budget is narrower or wider than the old one.
+pub(crate) fn apply_confine_budget(
+    lv2_cores: usize,
+    lv3_cores: usize,
+    reserve_cores: usize,
+) -> crate::error::OnyxResult<String> {
+    let Some(config) = CONFINE_CONFIG.get() else {
+        return Err(crate::error::OnyxError::Config(
+            "numa confine is not active; there is no core budget to rebuild".to_string(),
+        ));
+    };
+    let build = build_confine_budget(config, lv2_cores, lv3_cores, reserve_cores)?;
+    let summary = build.summary();
+    // ⚠ chunklet's uring execution pool copies `role_cpu_set()` at pool build
+    // time, so its workers keep the CPUs they were born with. Disabled on the
+    // canonical config; say so rather than let an arm read a budget that is
+    // only partly in force.
+    if config.chunklet.pd_write_foreground_workers > 0
+        || config.chunklet.pd_write_background_workers > 0
+    {
+        tracing::warn!(
+            "cores: chunklet uring execution pool is enabled and CACHED its CPU \
+             sets at pool build; those workers will NOT follow this swap"
+        );
+    }
+    build.log("numa confine budget swapped at runtime (cores IPC)");
+    crate::affinity::swap_confine(build.budget)
+        .map_err(|e| crate::error::OnyxError::Config(e.to_string()))?;
+    CONFINE_RESERVED_CORES.store(reserve_cores, std::sync::atomic::Ordering::Relaxed);
+    Ok(summary)
 }
 
 /// Inheritance + per-role binds are not enough: libublk's per-queue daemon
@@ -879,10 +1022,25 @@ fn spawn_confine_enforcer(_partition_all_cpus: Option<Vec<usize>>) {}
 #[cfg(target_os = "linux")]
 fn sweep_stray_threads(partition_all_cpus: Option<&[usize]>) {
     // Under confine, resolving through the live budget is what makes dedicated
-    // cores hold: the sweep compares masks EXACTLY and re-binds anything
-    // narrower, so a per-role carve-out is only stable if the sweep knows
-    // about it too.
-    let budget = crate::affinity::confine_budget();
+    // cores hold: the sweep compares masks EXACTLY and re-binds anything that
+    // DIFFERS — narrower or wider. That bidirectionality is what lets the
+    // `cores` IPC command swap the budget on a running engine: adding a
+    // dedication narrows the shared halves, dropping one widens them again,
+    // and both converge within two sweeps. A per-role carve-out is only stable
+    // because the sweep resolves through the same budget `bind_current` does.
+    //
+    // One guard for the whole sweep, so a swap landing mid-sweep cannot hand
+    // this pass two different budgets.
+    crate::affinity::with_confine_budget(|budget| {
+        sweep_with_budget(budget, partition_all_cpus)
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn sweep_with_budget(
+    budget: Option<&crate::affinity::CoreBudget>,
+    partition_all_cpus: Option<&[usize]>,
+) {
     if budget.is_none() && partition_all_cpus.is_none() {
         return;
     }

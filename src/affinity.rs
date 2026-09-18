@@ -1,4 +1,6 @@
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
+
+use arc_swap::ArcSwap;
 
 use crate::config::ThreadingConfig;
 
@@ -477,10 +479,32 @@ impl PartitionTopo {
     }
 }
 
-static LAYOUT: OnceLock<Option<LayoutKind>> = OnceLock::new();
+/// The active layout, swappable so a core-budget A/B can run its arms inside
+/// ONE engine process at one pool age instead of paying a restart per arm.
+///
+/// This used to be a `OnceLock<Option<LayoutKind>>`. The reason it can become
+/// mutable safely is that nothing caches a CPU mask for long: `bind_current`
+/// reads the layout when a thread spawns, and every already-running thread is
+/// swept back onto its role's set every 5 s by
+/// [`crate::numa::sweep_stray_threads`], whose test is EXACT set equality — so
+/// a swap converges in both directions (a new dedication narrows masks, and
+/// dropping one widens them again) within two sweeps.
+///
+/// ⚠ The one exception is `chunklet_pool::uring_pool_config`, which copies
+/// `role_cpu_set()` into chunklet's uring execution pool when that pool is
+/// built. Those CPUs do NOT follow a swap. `swap_confine` warns when the pool
+/// is live; on the canonical config `chunklet_io_execution` is disabled and no
+/// such pool exists.
+static LAYOUT: OnceLock<ArcSwap<Option<LayoutKind>>> = OnceLock::new();
+
+fn layout_cell() -> &'static ArcSwap<Option<LayoutKind>> {
+    LAYOUT.get_or_init(|| ArcSwap::from_pointee(None))
+}
 
 pub fn init(config: &ThreadingConfig) {
-    let _ = LAYOUT.set(AffinityLayout::from_config(config).map(LayoutKind::PerRole));
+    layout_cell().store(Arc::new(
+        AffinityLayout::from_config(config).map(LayoutKind::PerRole),
+    ));
     if config.enabled {
         onyx_metadb::affinity::configure(onyx_metadb::affinity::AffinityConfig {
             wal_cpus: config.metadb_wal_cpus.clone(),
@@ -500,19 +524,34 @@ pub fn init(config: &ThreadingConfig) {
 /// "numactl + threading.enabled=false" profile where metadb runs unpinned
 /// inside the node.
 pub fn init_confine(budget: CoreBudget) {
-    let _ = LAYOUT.set(Some(LayoutKind::Confine(budget)));
+    layout_cell().store(Arc::new(Some(LayoutKind::Confine(budget))));
+}
+
+/// Replace the live confine budget. Already-running threads converge on the
+/// new masks within two enforcer sweeps (~10 s); see [`LAYOUT`].
+///
+/// Refuses to act under any other layout: swapping a budget in while
+/// `[threading]` per-role pinning or partition mode is active would silently
+/// change which mechanism owns placement.
+pub fn swap_confine(budget: CoreBudget) -> Result<(), &'static str> {
+    if !is_confine_layout() {
+        return Err("numa.mode is not \"confine\"; there is no core budget to swap");
+    }
+    layout_cell().store(Arc::new(Some(LayoutKind::Confine(budget))));
+    Ok(())
 }
 
 /// Partition-mode layout (see `PartitionTopo`).
 pub fn init_partition(topo: PartitionTopo) {
-    let _ = LAYOUT.set(Some(LayoutKind::Partition(topo)));
+    layout_cell().store(Arc::new(Some(LayoutKind::Partition(topo))));
 }
 
 /// Return the complete CPU set assigned to a role by the active layout.
 /// An empty vector means affinity is not configured and the caller should
 /// inherit its creating thread's mask.
 pub fn role_cpu_set(role: ThreadRole) -> Vec<usize> {
-    let Some(Some(layout)) = LAYOUT.get() else {
+    let guard = layout_cell().load();
+    let Some(layout) = guard.as_ref().as_ref() else {
         return Vec::new();
     };
     layout.cpu_set_for_role(role)
@@ -521,20 +560,30 @@ pub fn role_cpu_set(role: ThreadRole) -> Vec<usize> {
 /// Whether the active runtime layout uses the strict foreground/background
 /// confine split.
 pub fn is_confine_layout() -> bool {
-    matches!(LAYOUT.get(), Some(Some(LayoutKind::Confine(_))))
+    matches!(
+        layout_cell().load().as_ref().as_ref(),
+        Some(LayoutKind::Confine(_))
+    )
 }
 
-/// The active confine budget, for the stray-thread enforcer. `None` under any
+/// Run `f` against the active confine budget, or against `None` under any
 /// other layout.
-pub fn confine_budget() -> Option<&'static CoreBudget> {
-    match LAYOUT.get() {
-        Some(Some(LayoutKind::Confine(budget))) => Some(budget),
-        _ => None,
+///
+/// Closure-based rather than returning a reference: the budget now lives behind
+/// an `ArcSwap`, and the caller must hold the guard for as long as it reads the
+/// budget. The stray-thread enforcer takes it once and sweeps every task under
+/// that one guard, so a swap mid-sweep cannot hand it two different budgets.
+pub fn with_confine_budget<R>(f: impl FnOnce(Option<&CoreBudget>) -> R) -> R {
+    let guard = layout_cell().load();
+    match guard.as_ref().as_ref() {
+        Some(LayoutKind::Confine(budget)) => f(Some(budget)),
+        _ => f(None),
     }
 }
 
 pub fn bind_current(role: ThreadRole, ordinal: usize) {
-    let Some(Some(layout)) = LAYOUT.get() else {
+    let guard = layout_cell().load();
+    let Some(layout) = guard.as_ref().as_ref() else {
         return;
     };
     let result = match layout {
@@ -694,6 +743,85 @@ mod budget_tests {
         let mut engine = engine;
         engine.sort_unstable();
         CoreBudget::new(engine.clone(), engine.clone(), engine)
+    }
+
+    /// The budget became swappable so a core-budget A/B can keep its arms in
+    /// one engine process. Two things have to hold for that to be safe, and
+    /// both are asserted here in ONE test so the assertions cannot race each
+    /// other through the process-global `LAYOUT`:
+    ///
+    /// 1. A swap is refused unless confine is the active layout — otherwise it
+    ///    would silently take placement away from `[threading]` per-role
+    ///    pinning or from partition mode.
+    /// 2. The swap is visible in BOTH directions. Narrowing (adding a
+    ///    dedication) is the easy case; widening matters just as much, because
+    ///    an arm that returns to the baseline has to actually give the cores
+    ///    back. The stray-thread enforcer converges on whatever
+    ///    `cpus_for_thread_name` reports, so that is what this checks.
+    ///
+    /// ⚠ This is the only test that writes `LAYOUT`. It resets it at both ends;
+    /// if a second test ever needs it, serialise them.
+    #[test]
+    fn a_live_budget_swap_is_refused_off_confine_and_visible_both_ways() {
+        layout_cell().store(Arc::new(None));
+
+        assert!(
+            swap_confine(shared_budget()).is_err(),
+            "swapping a budget in with no confine layout must be refused"
+        );
+
+        let all: &[usize] = &[0, 2, 4, 6, 8, 10, 12, 14];
+        init_confine(shared_budget());
+        assert_eq!(
+            with_confine_budget(|b| b
+                .expect("confine is active")
+                .cpus_for_thread_name("persistent-slot")
+                .map(<[usize]>::to_vec)),
+            Some(all.to_vec())
+        );
+
+        // Narrow: LV2 takes a core off its own half.
+        let mut narrowed = shared_budget();
+        narrowed
+            .dedicate(ThreadRole::BufferSync, &cores4(), 1)
+            .expect("one core of four is dedicable");
+        swap_confine(narrowed).expect("confine is active");
+        let lv2_narrow = with_confine_budget(|b| {
+            b.expect("confine is active")
+                .cpus_for_thread_name("persistent-slot")
+                .map(<[usize]>::to_vec)
+        })
+        .expect("LV2 resolves to a set");
+        assert_eq!(
+            lv2_narrow.len(),
+            2,
+            "one dedicated physical core is 2 logical CPUs, got {lv2_narrow:?}"
+        );
+        // And the cores really left the shared halves.
+        let shared_after = with_confine_budget(|b| {
+            b.expect("confine is active")
+                .cpus_for_thread_name("flusher-coalesce-3")
+                .map(<[usize]>::to_vec)
+        })
+        .expect("a shared role resolves to a set");
+        assert!(
+            lv2_narrow.iter().all(|cpu| !shared_after.contains(cpu)),
+            "dedicated CPUs {lv2_narrow:?} still appear in the shared set {shared_after:?}"
+        );
+
+        // Widen again: dropping the dedication must hand the cores back, which
+        // is what lets an arm return to its baseline.
+        swap_confine(shared_budget()).expect("confine is active");
+        assert_eq!(
+            with_confine_budget(|b| b
+                .expect("confine is active")
+                .cpus_for_thread_name("persistent-slot")
+                .map(<[usize]>::to_vec)),
+            Some(all.to_vec()),
+            "the swap back did not widen LV2 to the full engine set"
+        );
+
+        layout_cell().store(Arc::new(None));
     }
 
     /// `numa.foreground_cores_per_node = 0` makes both halves the full engine

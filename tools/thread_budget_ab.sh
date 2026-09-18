@@ -4,11 +4,15 @@
 #
 #   thread_budget_ab.sh <tag> [config] [arms...]
 #
-#   arm = <io_workers>:<read_pool_workers>[:<lv3_cores>[:<lv2_cores>[:<reserve_cores>[:<nr_queues>]]]]
+#   arm = <io_workers>:<read_pool_workers>[:<lv3_cores>[:<lv2_cores>[:<reserve_cores>[:<nr_queues>[:<coalesce_drivers>]]]]]
 #         Trailing fields are optional and default to the shipped values
-#         (lv3=0, lv2=0, reserve=2, nr_queues=32), so the shorter arms recorded
-#         in memory `thread_budget_io_readpool_ab` /
+#         (lv3=0, lv2=0, reserve=2, nr_queues=32, coalesce_drivers=0), so the
+#         shorter arms recorded in memory `thread_budget_io_readpool_ab` /
 #         `lv3_dedicated_cores_zero_sum` still mean what they meant.
+#
+#   coalesce_drivers is `flush.coalesce_pool_workers`; 0 leaves
+#   `shared_coalesce_pool` OFF (one dedicated admission thread per shard).
+#   Any N > 0 turns the pool on with N drivers.
 #
 #   nr_queues is `ublk.nr_queues`, the kernel device's queue count, and each
 #   queue costs one libublk `ublk-<vol>` OS thread (33 threads at 32, 9 at 8).
@@ -84,7 +88,26 @@ ARMS=${*:-"0:32 32:32 32:12 0:32"}
 B=/root/onyx_storage/target/release/onyx-storage
 CENSUS="$(dirname "$0")/thread_census.py"
 OUT=/root/p1/$TAG
-BURN=${BURN:-420}          # randrw 70/30 pins the LV2 ring at ~6 min
+# ⭐ 150, not 420. Box 2026-09-17: the 420 s figure was calibrated on a FRESH
+# pool, where the burst is 3-12x steady state. An engine restart clears the LV2
+# ring but NOT the pool, so on an AGED pool -- the only kind we A/B on -- the
+# ring refills fast and the burst is both short and shallow. Measured off p8's
+# own 5 s bw buckets (three identical arms, 30 s window means):
+#
+#   arm 1  662 650 | 542 543 565 544 561 538 562 608 551 552 531 571 582 578
+#   arm 2  591 563 | 543 547 561 567 566 555 571 553 569 546 569 553 575 566
+#   arm 3  597 587 | 558 551 557 558 569 575 543 538 541 546 559 561 576 547
+#
+# Steady from window 3 (t=60 s); burst is 1.17x, not 3-12x. Sampling t=60-270
+# gives 556.0 MiB/s against 560.6 for the t=240-485 window the 420 s burn
+# actually measured -- a 0.8% difference, and the EARLY windows are tighter
+# across arms (1.4% vs 2.7%). So 150 carries 2.5x margin over the observed
+# burst and costs nothing.
+#
+# ⚠ SCOPED TO randrw 70/30 ON AN AGED POOL. At RWMIX=0 the ring climbs
+# 6% -> 100% over ~7 minutes (see tools/lv3_submit_ab.sh) and 420 still stands;
+# on a fresh pool it stands too.
+BURN=${BURN:-150}
 SAMPLE=${SAMPLE:-150}
 VOL=${VOL:-fio-volume}
 
@@ -110,10 +133,10 @@ set_knob() {
 IDX=0
 for arm_spec in $ARMS; do
     IDX=$((IDX + 1))
-    IFS=: read -r io rp lv3 lv2 rsv nrq <<<"$arm_spec"
-    lv3=${lv3:-0}; lv2=${lv2:-0}; rsv=${rsv:-2}; nrq=${nrq:-32}
-    arm="$IDX.io$io-rp$rp-lv3$lv3-lv2$lv2-rsv$rsv-nrq$nrq"
-    echo "=== arm $arm (io_workers=$io read_pool_workers=$rp lv3_cores=$lv3 lv2_cores=$lv2 reserve_cores=$rsv nr_queues=$nrq)  $(date -Is) ===" \
+    IFS=: read -r io rp lv3 lv2 rsv nrq cpool <<<"$arm_spec"
+    lv3=${lv3:-0}; lv2=${lv2:-0}; rsv=${rsv:-2}; nrq=${nrq:-32}; cpool=${cpool:-0}
+    arm="$IDX.io$io-rp$rp-lv3$lv3-lv2$lv2-rsv$rsv-nrq$nrq-cp$cpool"
+    echo "=== arm $arm (io_workers=$io read_pool_workers=$rp lv3_cores=$lv3 lv2_cores=$lv2 reserve_cores=$rsv nr_queues=$nrq coalesce_drivers=$cpool)  $(date -Is) ===" \
         | tee -a "$OUT/plan"
     if [ "$nrq" != "32" ] && [ "$io" = "0" ]; then
         echo "FAIL: arm $arm moves nr_queues with io_workers=0, so io_workers would move too" >&2
@@ -132,6 +155,13 @@ for arm_spec in $ARMS; do
     set_knob lv2_dedicated_cores "$lv2" cores | tee -a "$OUT/plan"
     set_knob reserve_cores_per_node "$rsv" numa | tee -a "$OUT/plan"
     set_knob nr_queues "$nrq" ublk | tee -a "$OUT/plan"
+    if [ "$cpool" = "0" ]; then
+        set_knob shared_coalesce_pool false flush | tee -a "$OUT/plan"
+        set_knob coalesce_pool_workers 0 flush | tee -a "$OUT/plan"
+    else
+        set_knob shared_coalesce_pool true flush | tee -a "$OUT/plan"
+        set_knob coalesce_pool_workers "$cpool" flush | tee -a "$OUT/plan"
+    fi
 
     "$B" -c "$CFG" cleanup-ublk >/dev/null 2>&1
     sleep 3
@@ -173,6 +203,22 @@ for arm_spec in $ARMS; do
     fi
     if [ "$eff_nrq" != "$nrq" ]; then
         echo "FAIL: arm $arm asked nr_queues=$nrq but engine started $eff_nrq" >&2
+        exit 1
+    fi
+    # The admission pool logs `drivers=N lanes=M` only when it is ON, so its
+    # absence IS the proof for a `cpool=0` arm. Without this, a config typo
+    # would produce a silent duplicate baseline.
+    eff_cpool=$(sed -E 's/\x1b\[[0-9;]*m//g' "$OUT/engine.$arm.log" \
+        | grep -m1 'flusher shared coalesce pool started' \
+        | grep -oE 'drivers=[0-9]+' | head -1 | cut -d= -f2)
+    echo "effective: coalesce_drivers=${eff_cpool:-off} (want ${cpool})" | tee -a "$OUT/plan"
+    if [ "$cpool" = "0" ]; then
+        if [ -n "$eff_cpool" ]; then
+            echo "FAIL: arm $arm wanted no coalesce pool, engine started $eff_cpool drivers" >&2
+            exit 1
+        fi
+    elif [ "$eff_cpool" != "$cpool" ]; then
+        echo "FAIL: arm $arm asked coalesce_drivers=$cpool but engine started ${eff_cpool:-off}" >&2
         exit 1
     fi
     if [ -n "$eff_rp" ] && [ "$eff_rp" != "$rp" ]; then
@@ -248,4 +294,6 @@ set_knob lv3_dedicated_cores 0 cores | tee -a "$OUT/plan"
 set_knob lv2_dedicated_cores 0 cores | tee -a "$OUT/plan"
 set_knob reserve_cores_per_node 2 numa | tee -a "$OUT/plan"
 set_knob nr_queues 32 ublk | tee -a "$OUT/plan"
+set_knob shared_coalesce_pool false flush | tee -a "$OUT/plan"
+set_knob coalesce_pool_workers 0 flush | tee -a "$OUT/plan"
 echo "done — knobs restored to the shipped values. Compare $OUT/census.* ."

@@ -1189,6 +1189,80 @@ impl ServiceController {
                         .write_all(b"error: chunklet io_uring submit is Linux-only\n");
                     let _ = stream.flush();
                 }
+                // Rebuild the confine CPU budget on a LIVE engine. Same
+                // motivation as the two shape knobs above — keep an A/B's arms
+                // in one process at one pool age — but here the mechanism is
+                // affinity rather than a global atomic: the stray-thread
+                // enforcer re-pins every thread onto its role's set every 5 s
+                // and its test is EXACT set equality, so a swap converges in
+                // both directions (a new dedication narrows the shared halves,
+                // dropping one widens them again) within two sweeps.
+                //
+                // ⚠ Wait ~10 s after a flip before opening a measurement
+                // window; tools/core_budget_ab.sh does.
+                //
+                // Only the three core parameters are settable. The rebuild
+                // reads the config SNAPSHOT taken at confine setup, never the
+                // file on disk, because the restart-per-arm harness rewrites
+                // that file (see numa::CONFINE_CONFIG).
+                #[cfg(target_os = "linux")]
+                "cores" => {
+                    if parts.len() >= 4 {
+                        let parsed = parts[1]
+                            .parse::<usize>()
+                            .and_then(|lv2| parts[2].parse::<usize>().map(|lv3| (lv2, lv3)))
+                            .and_then(|(lv2, lv3)| {
+                                parts[3]
+                                    .trim()
+                                    .parse::<usize>()
+                                    .map(|rsv| (lv2, lv3, rsv))
+                            });
+                        match parsed {
+                            Ok((lv2, lv3, rsv)) => {
+                                match crate::numa::apply_confine_budget(lv2, lv3, rsv) {
+                                    Ok(summary) => {
+                                        tracing::info!(
+                                            requested_lv2 = lv2,
+                                            requested_lv3 = lv3,
+                                            requested_reserve = rsv,
+                                            effective = %summary,
+                                            "core budget swapped"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        let msg = format!("error: {e}\n");
+                                        let _ = stream.write_all(msg.as_bytes());
+                                        let _ = stream.flush();
+                                        continue;
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                let _ = stream.write_all(
+                                    b"error: usage: cores [<lv2_cores> <lv3_cores> <reserve_cores>]\n",
+                                );
+                                let _ = stream.flush();
+                                continue;
+                            }
+                        }
+                    } else if parts.len() != 1 {
+                        let _ = stream.write_all(
+                            b"error: usage: cores [<lv2_cores> <lv3_cores> <reserve_cores>]\n",
+                        );
+                        let _ = stream.flush();
+                        continue;
+                    }
+                    // Echo what is actually in force, so an arm can self-prove
+                    // off the LIVE object rather than off the config it wrote.
+                    let msg = format!("{}\nok\n", crate::numa::confine_budget_summary());
+                    let _ = stream.write_all(msg.as_bytes());
+                    let _ = stream.flush();
+                }
+                #[cfg(not(target_os = "linux"))]
+                "cores" => {
+                    let _ = stream.write_all(b"error: numa confine is Linux-only\n");
+                    let _ = stream.flush();
+                }
                 "mode" => {
                     let guard = engine.load();
                     let opt: &Option<OnyxEngine> = &guard;
