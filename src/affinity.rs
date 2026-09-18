@@ -29,13 +29,25 @@ pub enum ThreadRole {
     /// home them with the commit workers; legacy `[threading]` configs fall
     /// back to `flusher_cleanup_cpus`.
     FlusherPostCommit,
+    /// The `metaio-*` page-write pool over the chunklet meta LD plus the single
+    /// `metadb-checkpoint` coordinator thread.
     MetadbCheckpoint,
+    /// metadb's own apply lanes (`onyx-metadb-apply-lane`).
+    ///
+    /// ⚠ **No `bind_current` call site exists for this role, and that is
+    /// deliberate**: the lanes are spawned inside metadb, which under confine
+    /// is left unpinned on purpose (`init_confine` does not configure
+    /// `onyx_metadb::affinity`). The role exists so the stray-thread enforcer
+    /// can *name* them — which is the only thing a wait-class fence needs, and
+    /// the reason the fence can reuse the same `dedicated` table as the LV2/LV3
+    /// carve-outs instead of carrying a second resolution path.
+    MetadbApply,
     Background,
 }
 
 impl ThreadRole {
     /// Number of variants — the width of [`CoreBudget`]'s per-role table.
-    pub const COUNT: usize = 13;
+    pub const COUNT: usize = 14;
 
     /// Dense index for per-role tables. Kept next to the enum so adding a
     /// variant without extending `COUNT` fails to compile on the match.
@@ -53,9 +65,112 @@ impl ThreadRole {
             Self::CommitWorker => 9,
             Self::FlusherPostCommit => 10,
             Self::MetadbCheckpoint => 11,
-            Self::Background => 12,
+            Self::MetadbApply => 12,
+            Self::Background => 13,
         }
     }
+}
+
+/// One member of the **wait class**: a thread group sized for *concurrency*
+/// rather than for work, which a [`CoreBudget`] fence can pack onto a few cores.
+///
+/// Box census 2026-09-18 (310 threads, 44 confined cores): 176 threads — 57% of
+/// the engine — ask for **19.49 CPUs between them**, because each one is there
+/// to be able to block without holding up the thread behind it. Their
+/// per-thread duty (`meanR / threads`) is 5-8%, against 70-73% for `read-pool`
+/// and 47% for `ublk-io-worker`. Scattered across all 44 CPUs they do nothing
+/// but preempt the stages that are actually computing.
+///
+/// ⭐ Every dedication arm before this one gave cores TO a busy role and lost:
+/// total demand is 70.5 CPUs against 44 cores, so a carve-out turns shared
+/// capacity into *private idle* capacity (memory
+/// `lv2_dedication_throughput_retracted`: contention −13%, throughput −2.5%,
+/// because LV2's 10 CPUs only ever ran 6.48 deep). The rule that came out of it
+/// — **size a reservation so its set is nearly fully used, or do not make it** —
+/// is what a wait-class fence is for: these four groups are 120 threads at
+/// **7.67 mean runnable**, so four physical cores (8 logical) run ~96% utilised
+/// while 120 threads leave the runqueues of the other 36 CPUs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaitClassGroup {
+    /// metadb's 64 apply lanes: 3.59 meanR, **5.6% duty** — the largest and
+    /// most lopsided group in the engine. ⚠ Their COUNT is topology and cannot
+    /// be reduced (a commit needs every touched shard's slot started, so fewer
+    /// lanes deadlock — memory
+    /// `metadb_apply_lane_count_is_topology_not_pool_size`); their CPU
+    /// footprint is exactly what a fence can compress instead.
+    MetadbApply,
+    /// The 32-thread `metaio` page-write pool plus `metadb-checkpoint`: 2.47
+    /// meanR, 7.7% duty, maxR 14.
+    MetaIo,
+    /// 16 flush writer threads: 1.12 meanR, 7.0% duty. ⚠ Low duty but ON the
+    /// LV3 submit path, so fencing it is the part of the arm most likely to
+    /// show up as write p99 rather than as throughput.
+    FlusherWriter,
+    /// 8 post-commit cleanup workers: 0.49 meanR, 6.1% duty.
+    FlusherPostCommit,
+}
+
+impl WaitClassGroup {
+    pub const ALL: [WaitClassGroup; 4] = [
+        Self::MetadbApply,
+        Self::MetaIo,
+        Self::FlusherWriter,
+        Self::FlusherPostCommit,
+    ];
+
+    /// The role whose `dedicated` slot this group's threads resolve through.
+    pub const fn role(self) -> ThreadRole {
+        match self {
+            Self::MetadbApply => ThreadRole::MetadbApply,
+            Self::MetaIo => ThreadRole::MetadbCheckpoint,
+            Self::FlusherWriter => ThreadRole::FlusherWriter,
+            Self::FlusherPostCommit => ThreadRole::FlusherPostCommit,
+        }
+    }
+
+    /// Config / IPC spelling, and what [`parse_wait_class_groups`] accepts.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::MetadbApply => "metadb-apply",
+            Self::MetaIo => "metaio",
+            Self::FlusherWriter => "flusher-writer",
+            Self::FlusherPostCommit => "flusher-post-commit",
+        }
+    }
+}
+
+/// Parse a `cores.wait_class_groups` / `cores <..> <groups>` spec.
+///
+/// Empty or `"all"` means every group. An unknown name is an error rather than
+/// a warning: a silently-dropped group would make an A/B arm measure a
+/// different fence than the one it reported, which is the failure mode the
+/// self-proving arms exist to prevent.
+pub fn parse_wait_class_groups(spec: &str) -> Result<Vec<WaitClassGroup>, String> {
+    let spec = spec.trim();
+    if spec.is_empty() || spec.eq_ignore_ascii_case("all") {
+        return Ok(WaitClassGroup::ALL.to_vec());
+    }
+    let mut groups: Vec<WaitClassGroup> = Vec::new();
+    for part in spec.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let group = WaitClassGroup::ALL
+            .iter()
+            .copied()
+            .find(|g| g.name().eq_ignore_ascii_case(part))
+            .ok_or_else(|| {
+                format!(
+                    "unknown wait-class group {part:?} (known: {}, or \"all\")",
+                    WaitClassGroup::ALL
+                        .iter()
+                        .map(|g| g.name())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })?;
+        if !groups.contains(&group) {
+            groups.push(group);
+        }
+    }
+    Ok(groups)
 }
 
 /// Which CPUs each role may run on under `numa.mode = "confine"`.
@@ -88,6 +203,13 @@ pub struct CoreBudget {
     /// shares the foreground/background half it would have used anyway, so an
     /// all-`None` table reproduces the previous behaviour exactly.
     dedicated: Vec<Option<Vec<usize>>>,
+    /// The wait-class fence, if one is in force: the CPUs and the groups
+    /// sharing them. Those groups' roles also hold the same set in
+    /// `dedicated`, which is what makes every resolution path (`cpus_for`,
+    /// `cpus_for_thread_name`, the enforcer) agree without a second mechanism.
+    /// This field exists so the fence can be *reported* as one set rather than
+    /// as N identical role dedications.
+    wait_fence: Option<(Vec<usize>, Vec<WaitClassGroup>)>,
 }
 
 impl CoreBudget {
@@ -99,32 +221,14 @@ impl CoreBudget {
             foreground,
             background,
             dedicated: vec![None; ThreadRole::COUNT],
+            wait_fence: None,
         }
     }
 
-    /// Give `role` `core_count` physical cores of its own.
-    ///
-    /// Cores come off the END of the background half, matching
-    /// `NumaNode::engine_cpus`, which reserves the highest-numbered cores for
-    /// the OS — so the dedicated set lands adjacent to the OS reserve instead
-    /// of fragmenting the middle of the node.
-    ///
-    /// Both HT siblings of a core move together: handing out one sibling while
-    /// a shared pool keeps the other would leave the "dedicated" thread
-    /// sharing execution resources with whatever landed next door, which is
-    /// most of the interference this is meant to remove.
-    ///
-    /// ⚠ The taken CPUs are removed from **both** halves, not just the one
-    /// they were drawn from. `numa.foreground_cores_per_node` defaults to 0,
-    /// and `confine_cpu_sets` then returns the *same full engine set* for both
-    /// halves — so removing them from the background alone would leave ublk
-    /// and the LV2 sync threads still eligible to run there, and the
-    /// reservation would mean nothing in exactly the shipped configuration.
-    ///
-    /// Errors rather than warns when the carve-out would empty either half. A
-    /// config that starves other roles is a startup mistake, and the engine
-    /// already refuses over-budget confine configs rather than limping (see
-    /// `numa::setup_confine`).
+    /// Give `role` `core_count` physical cores of its own. The carve-out rules
+    /// (whole cores off the end of the role's own half, removed from both
+    /// halves, error rather than warn when a half would empty) live in
+    /// [`Self::take_cores`], which [`Self::fence_wait_class`] shares.
     pub fn dedicate(
         &mut self,
         role: ThreadRole,
@@ -134,11 +238,99 @@ impl CoreBudget {
         if core_count == 0 {
             return Ok(());
         }
-        // Draw from the half this role would otherwise share, so a foreground
-        // role (BufferSync) does not get cores carved out of the background
-        // pool it never ran on. Only whole cores count: one straddling the
-        // foreground/background boundary is not that half's to hand out.
-        let own_half: std::collections::HashSet<usize> = if role_uses_foreground_set(role) {
+        let taken = self.take_cores(
+            role_uses_foreground_set(role),
+            cores,
+            core_count,
+            &format!("cores.{}_dedicated_cores", role_knob_name(role)),
+            &format!("{role:?}"),
+        )?;
+        self.dedicated[role.index()] = Some(taken);
+        Ok(())
+    }
+
+    /// Pack the [`WaitClassGroup`]s in `groups` onto `core_count` cores of
+    /// their own — the inverse of [`Self::dedicate`], which hands cores to a
+    /// *busy* role.
+    ///
+    /// Implemented as one carve-out written into every member role's
+    /// `dedicated` slot, so `cpus_for`, `cpus_for_thread_name` and the
+    /// stray-thread enforcer resolve it through machinery that is already
+    /// proven; nothing here is a second placement mechanism.
+    ///
+    /// ⚠ Call this LAST, after the LV2/LV3 dedications: all three draw off the
+    /// end of the same half, so claiming in a stable order keeps a given
+    /// `lv2`/`lv3` value landing on the same CPUs whether or not a fence is
+    /// also armed — otherwise two arms of one A/B would differ in more than the
+    /// knob under test.
+    pub fn fence_wait_class(
+        &mut self,
+        cores: &[Vec<usize>],
+        core_count: usize,
+        groups: &[WaitClassGroup],
+    ) -> crate::error::OnyxResult<()> {
+        if core_count == 0 || groups.is_empty() {
+            return Ok(());
+        }
+        // Every wait-class group is a background role, so the fence never
+        // raids the foreground half that ublk and the LV2 sync threads share.
+        debug_assert!(
+            groups
+                .iter()
+                .all(|g| !role_uses_foreground_set(g.role())),
+            "a foreground role in the wait class would take cores from ublk/LV2"
+        );
+        let taken = self.take_cores(
+            false,
+            cores,
+            core_count,
+            "cores.wait_class_cores",
+            "the wait class",
+        )?;
+        for group in groups {
+            self.dedicated[group.role().index()] = Some(taken.clone());
+        }
+        self.wait_fence = Some((taken, groups.to_vec()));
+        Ok(())
+    }
+
+    /// Take `core_count` whole cores out of one half and out of the other.
+    ///
+    /// Cores come off the END of that half, matching `NumaNode::engine_cpus`,
+    /// which reserves the highest-numbered cores for the OS — so a carve-out
+    /// lands adjacent to the OS reserve instead of fragmenting the middle of
+    /// the node.
+    ///
+    /// Both HT siblings of a core move together: handing out one sibling while
+    /// a shared pool keeps the other would leave the "dedicated" thread sharing
+    /// execution resources with whatever landed next door, which is most of the
+    /// interference this is meant to remove.
+    ///
+    /// ⚠ The taken CPUs are removed from **both** halves, not just the one they
+    /// were drawn from. `numa.foreground_cores_per_node` defaults to 0, and
+    /// `confine_cpu_sets` then returns the *same full engine set* for both
+    /// halves — so removing them from the background alone would leave ublk and
+    /// the LV2 sync threads still eligible to run there, and the reservation
+    /// would mean nothing in exactly the shipped configuration.
+    ///
+    /// Errors rather than warns when the carve-out would empty either half. A
+    /// config that starves other roles is a startup mistake, and the engine
+    /// already refuses over-budget confine configs rather than limping (see
+    /// `numa::setup_confine`).
+    fn take_cores(
+        &mut self,
+        from_foreground: bool,
+        cores: &[Vec<usize>],
+        core_count: usize,
+        knob: &str,
+        sharer: &str,
+    ) -> crate::error::OnyxResult<Vec<usize>> {
+        // Draw from the half these threads would otherwise share, so a
+        // foreground role (BufferSync) does not get cores carved out of the
+        // background pool it never ran on. Only whole cores count: one
+        // straddling the foreground/background boundary is not that half's to
+        // hand out.
+        let own_half: std::collections::HashSet<usize> = if from_foreground {
             self.foreground.iter().copied().collect()
         } else {
             self.background.iter().copied().collect()
@@ -166,12 +358,11 @@ impl CoreBudget {
             .count();
         if candidates.len() < core_count || background_left == 0 || foreground_left == 0 {
             return Err(crate::error::OnyxError::Config(format!(
-                "cores.{}_dedicated_cores = {core_count} does not fit: this node offers \
-                 {} whole core(s) in the half {role:?} shares, and the carve-out would \
+                "{knob} = {core_count} does not fit: this node offers \
+                 {} whole core(s) in the half {sharer} shares, and the carve-out would \
                  leave {foreground_left} foreground / {background_left} shared-background \
                  CPU(s) (engine cpus {:?}). Lower it, lower another cores.* knob, or give \
                  cores back with numa.reserve_cores_per_node.",
-                role_knob_name(role),
                 candidates.len(),
                 self.engine,
             )));
@@ -180,8 +371,7 @@ impl CoreBudget {
         self.foreground.retain(|cpu| !taken_set.contains(cpu));
         let mut taken = taken;
         taken.sort_unstable();
-        self.dedicated[role.index()] = Some(taken);
-        Ok(())
+        Ok(taken)
     }
 
     /// CPUs `role` may run on: its exclusive set if it has one, else the half
@@ -238,15 +428,33 @@ impl CoreBudget {
     }
 
     /// Roles holding exclusive CPUs, for the startup log.
+    ///
+    /// Wait-class members are excluded: they all hold the *same* set, and
+    /// printing it once per member would bury the one thing an A/B arm greps
+    /// for. [`Self::wait_fence`] reports it instead.
     pub fn dedications(&self) -> Vec<(ThreadRole, &[usize])> {
         ALL_THREAD_ROLES
             .iter()
+            .filter(|&&role| !self.role_is_fenced(role))
             .filter_map(|&role| {
                 self.dedicated[role.index()]
                     .as_deref()
                     .map(|cpus| (role, cpus))
             })
             .collect()
+    }
+
+    /// The wait-class fence in force: its CPUs and the groups sharing them.
+    pub fn wait_fence(&self) -> Option<(&[usize], &[WaitClassGroup])> {
+        self.wait_fence
+            .as_ref()
+            .map(|(cpus, groups)| (cpus.as_slice(), groups.as_slice()))
+    }
+
+    fn role_is_fenced(&self, role: ThreadRole) -> bool {
+        self.wait_fence
+            .as_ref()
+            .is_some_and(|(_, groups)| groups.iter().any(|g| g.role() == role))
     }
 }
 
@@ -263,6 +471,7 @@ const ALL_THREAD_ROLES: [ThreadRole; ThreadRole::COUNT] = [
     ThreadRole::CommitWorker,
     ThreadRole::FlusherPostCommit,
     ThreadRole::MetadbCheckpoint,
+    ThreadRole::MetadbApply,
     ThreadRole::Background,
 ];
 
@@ -325,6 +534,26 @@ fn role_for_thread_name(name: &str) -> Option<ThreadRole> {
     }
     if name.starts_with("ckuring-fg-") {
         return Some(ThreadRole::BufferSync);
+    }
+    // The wait class. These four prefixes only change placement while a fence
+    // is armed — `cpus_for_thread_name` consults a role only when it holds a
+    // dedicated set, and none of these roles has a `cores.*_dedicated_cores`
+    // knob — so adding them is a no-op at `wait_class_cores = 0`.
+    if name.starts_with("flusher-writer") {
+        return Some(ThreadRole::FlusherWriter);
+    }
+    if name.starts_with("flusher-post-co") {
+        return Some(ThreadRole::FlusherPostCommit);
+    }
+    // `metaio-<idx>` (the meta LD page-write pool) plus the single
+    // `metadb-checkpoint` coordinator; both bind `MetadbCheckpoint`.
+    if name.starts_with("metaio") || name.starts_with("metadb-checkpo") {
+        return Some(ThreadRole::MetadbCheckpoint);
+    }
+    // metadb's apply lanes. This is the ONLY way they can be placed: metadb
+    // spawns them itself and nothing calls `bind_current` for them.
+    if name.starts_with("onyx-metadb-app") {
+        return Some(ThreadRole::MetadbApply);
     }
     None
 }
@@ -686,6 +915,11 @@ impl AffinityLayout {
                 &self.flusher_cleanup
             }
             ThreadRole::MetadbCheckpoint => &self.metadb_checkpoint,
+            // Unreachable in practice: nothing calls `bind_current` for the
+            // apply lanes, and legacy `[threading]` mode places metadb through
+            // `onyx_metadb::affinity` instead. `background` is what an
+            // unconfigured metadb thread inherited under this layout.
+            ThreadRole::MetadbApply => &self.background,
             ThreadRole::Background => &self.background,
         }
     }
@@ -935,6 +1169,195 @@ mod budget_tests {
         // Concretely: ublk and LV2 sync can no longer be scheduled there.
         for role in [ThreadRole::Ublk, ThreadRole::BufferSync] {
             assert_eq!(budget.cpus_for(role), &[0, 2, 4, 8, 10, 12], "{role:?}");
+        }
+    }
+
+    /// The fence is one carve-out shared by every member group, and all four
+    /// spawn-site names — including the two the kernel truncates and the one
+    /// metadb spawns itself — must sweep to it. If any of them resolved to the
+    /// shared half instead, the enforcer would drag that group back out within
+    /// one 5 s sweep and the arm would measure a partial fence.
+    #[test]
+    fn a_wait_class_fence_collects_every_member_group_on_one_set() {
+        let mut budget = shared_budget();
+        budget
+            .fence_wait_class(&cores4(), 1, &WaitClassGroup::ALL)
+            .expect("1 of 4 cores leaves 3 shared");
+
+        let fenced: &[usize] = &[6, 14];
+        for name in [
+            "flusher-writer-3\n",
+            "flusher-writer-\n",   // 15-char comm truncation
+            "flusher-post-co\n",   // "flusher-post-commit-7" truncated
+            "metaio-11\n",
+            "metadb-checkpoi\n",   // "metadb-checkpoint" truncated
+            "onyx-metadb-app\n",   // "onyx-metadb-apply-lane" truncated
+        ] {
+            assert_eq!(
+                budget.cpus_for_thread_name(name),
+                Some(fenced),
+                "{name:?} must sweep to the fence"
+            );
+        }
+        // And the fence really left both shared halves, so the busy stages it
+        // is meant to stop preempting cannot be scheduled there either.
+        for role in [
+            ThreadRole::Ublk,
+            ThreadRole::ReadPool,
+            ThreadRole::FlusherCompress,
+            ThreadRole::BufferSync,
+        ] {
+            assert_eq!(budget.cpus_for(role), &[0, 2, 4, 8, 10, 12], "{role:?}");
+        }
+        // Reported as ONE set, not as four identical role dedications.
+        assert!(budget.dedications().is_empty());
+        let (cpus, groups) = budget.wait_fence().expect("a fence is in force");
+        assert_eq!(cpus, fenced);
+        assert_eq!(groups.len(), 4);
+    }
+
+    /// A subset arm (`wait_class_groups = "metadb-apply,metaio"`) exists so the
+    /// LV3-submit-path group can be left out; the groups NOT named must keep
+    /// landing on the shared half.
+    #[test]
+    fn a_group_subset_fences_only_the_groups_it_names() {
+        let mut budget = shared_budget();
+        budget
+            .fence_wait_class(
+                &cores4(),
+                1,
+                &[WaitClassGroup::MetadbApply, WaitClassGroup::MetaIo],
+            )
+            .unwrap();
+
+        let fenced: &[usize] = &[6, 14];
+        let shared: &[usize] = &[0, 2, 4, 8, 10, 12];
+        assert_eq!(budget.cpus_for_thread_name("onyx-metadb-app\n"), Some(fenced));
+        assert_eq!(budget.cpus_for_thread_name("metaio-3\n"), Some(fenced));
+        assert_eq!(
+            budget.cpus_for_thread_name("flusher-writer-3\n"),
+            Some(shared),
+            "an unnamed group must not be dragged into the fence"
+        );
+        assert_eq!(
+            budget.cpus_for_thread_name("flusher-post-co\n"),
+            Some(shared)
+        );
+    }
+
+    /// LV2, LV3 and the fence all draw off the end of the same half, so the
+    /// three sets have to be disjoint — and the fence has to claim LAST, or a
+    /// given `lv3` value would land on different CPUs depending on whether a
+    /// fence was armed, and an A/B would differ in more than its knob.
+    #[test]
+    fn a_fence_claims_after_the_dedications_and_stays_disjoint_from_them() {
+        // 8 physical cores, SMT2: cores {0,16}, {2,18} ... {14,30}.
+        let cores: Vec<Vec<usize>> = (0..8).map(|i| vec![i * 2, i * 2 + 16]).collect();
+        let mut engine: Vec<usize> = cores.iter().flatten().copied().collect();
+        engine.sort_unstable();
+
+        let build = |fence: usize| {
+            let mut b = CoreBudget::new(engine.clone(), engine.clone(), engine.clone());
+            b.dedicate(ThreadRole::BufferSync, &cores, 1).unwrap();
+            b.dedicate(ThreadRole::Lv3Batch, &cores, 1).unwrap();
+            if fence > 0 {
+                b.fence_wait_class(&cores, fence, &WaitClassGroup::ALL)
+                    .unwrap();
+            }
+            b
+        };
+
+        let without = build(0);
+        let with = build(2);
+        assert_eq!(
+            with.cpus_for(ThreadRole::Lv3Batch),
+            without.cpus_for(ThreadRole::Lv3Batch),
+            "arming a fence moved LV3's cores; the claim order is wrong"
+        );
+        assert_eq!(
+            with.cpus_for(ThreadRole::BufferSync),
+            without.cpus_for(ThreadRole::BufferSync)
+        );
+
+        let (fence, _) = with.wait_fence().unwrap();
+        assert_eq!(fence.len(), 4, "2 physical cores on SMT2");
+        for cpu in fence {
+            assert!(!with.cpus_for(ThreadRole::Lv3Batch).contains(cpu));
+            assert!(!with.cpus_for(ThreadRole::BufferSync).contains(cpu));
+            assert!(!with.cpus_for(ThreadRole::ReadPool).contains(cpu));
+        }
+        // LV2's dedication is still reported on its own; only fence members are
+        // folded into `wait_fence`.
+        assert_eq!(with.dedications().len(), 2);
+    }
+
+    #[test]
+    fn a_fence_that_would_empty_the_shared_half_is_an_error() {
+        let mut budget = shared_budget();
+        for ask in [4, 5, 99] {
+            let mut b = budget.clone();
+            assert!(
+                matches!(
+                    b.fence_wait_class(&cores4(), ask, &WaitClassGroup::ALL),
+                    Err(crate::error::OnyxError::Config(_))
+                ),
+                "fencing {ask} of 4 cores must be refused"
+            );
+        }
+        // Zero cores, or cores with no groups, are both no-ops: the shipped
+        // default must be byte-for-byte the shared budget.
+        budget
+            .fence_wait_class(&cores4(), 0, &WaitClassGroup::ALL)
+            .unwrap();
+        budget.fence_wait_class(&cores4(), 2, &[]).unwrap();
+        assert!(budget.wait_fence().is_none());
+        assert_eq!(budget.background_cpus(), &[0, 2, 4, 6, 8, 10, 12, 14]);
+        assert_eq!(
+            budget.cpus_for_thread_name("onyx-metadb-app\n"),
+            Some(&[0usize, 2, 4, 6, 8, 10, 12, 14][..]),
+            "with no fence the apply lanes must land exactly where they used to"
+        );
+    }
+
+    /// An unknown group name is an error, not a warning: silently dropping one
+    /// would make an arm measure a different fence than it reported.
+    #[test]
+    fn wait_class_group_specs_parse_or_fail_loudly() {
+        assert_eq!(
+            parse_wait_class_groups("").unwrap(),
+            WaitClassGroup::ALL.to_vec()
+        );
+        assert_eq!(
+            parse_wait_class_groups("  all ").unwrap(),
+            WaitClassGroup::ALL.to_vec()
+        );
+        assert_eq!(
+            parse_wait_class_groups("metaio, metadb-apply ,metaio").unwrap(),
+            vec![WaitClassGroup::MetaIo, WaitClassGroup::MetadbApply],
+            "duplicates collapse, order follows the spec"
+        );
+        let err = parse_wait_class_groups("metadb-apply,flusher-dedup").unwrap_err();
+        assert!(err.contains("flusher-dedup"), "{err}");
+        assert!(err.contains("metadb-apply"), "the error must list the known names: {err}");
+    }
+
+    /// Every wait-class group's role must be a BACKGROUND role: a foreground
+    /// member would carve the fence out of the half ublk and the LV2 sync
+    /// threads share, which is the opposite of the intent.
+    #[test]
+    fn every_wait_class_group_is_a_background_role() {
+        for group in WaitClassGroup::ALL {
+            assert!(
+                !role_uses_foreground_set(group.role()),
+                "{:?} is a foreground role",
+                group
+            );
+            // And the role must be resolvable from a thread name, or the
+            // enforcer cannot hold the fence.
+            assert!(
+                ALL_THREAD_ROLES.contains(&group.role()),
+                "{group:?} maps to a role missing from ALL_THREAD_ROLES"
+            );
         }
     }
 

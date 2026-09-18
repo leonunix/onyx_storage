@@ -609,4 +609,56 @@ lv3_dedicated_cores = 0
 # ⚠ Pair with a lower numa.reserve_cores_per_node when testing: BufferSync is a
 # foreground role and foreground_cores_per_node=0 makes both halves the full
 # engine set, so the carve-out is otherwise taken straight out of everyone else.
+#
+# ⛔⛔ MEASURED 2026-09-18, 8 interleaved segments in ONE process (memory
+# `lv2_dedication_throughput_retracted`): the earlier +5.4% does NOT reproduce.
+# Against a THREE-point bracket, lv2=5 + reserve=0 came in at -2.47%. The
+# MECHANISM is not in doubt (LV2 preemption -66.1%, total involuntary -13.0%),
+# but contention fell while throughput fell ⇒ the binding constraint is
+# CAPACITY, and a dedication converts shared capacity into private IDLE capacity
+# (10 CPUs for 6.48 meanR = 35% wasted). Keep it at 0.
 lv2_dedicated_cores = 0
+# Physical cores the WAIT CLASS is fenced onto — the INVERSE of the two knobs
+# above, and the reason it exists is that both of them lost.
+#
+# Census 2026-09-18 (310 threads / 44 confined cores): 176 threads — 57% of the
+# engine — ask for 19.49 CPUs BETWEEN THEM, at 5-8% per-thread duty, because
+# they are sized for CONCURRENCY (each must be able to block without holding up
+# the thread behind it) and not for work. Total demand is 70.5 CPUs against 44,
+# so handing cores to a busy role cannot create capacity; packing the waiters
+# can, because low duty tolerates oversubscription by definition.
+#   metadb-apply         64 thr  meanR 3.59   5.6% duty
+#   metaio               32 thr  meanR 2.47   7.7%
+#   flusher-writer       16 thr  meanR 1.12   7.0%
+#   flusher-post-commit   8 thr  meanR 0.49   6.1%
+#   ---------------------------------------------------
+#   all four            120 thr  meanR 7.67   -> 4 cores (8 logical) = ~96% used
+#
+# ⛔⛔ MEASURED 2026-09-18, 7 interleaved segments in ONE process (memory
+# `wait_class_fence_raises_total_preemption`): the fence WORKS and the hypothesis
+# is FALSIFIED. All 120 threads confine correctly, the fenced set ran 91% used --
+# the criterion the LV2 retraction said to size by -- and it still lost:
+#   arm            MiB/s   involuntary/s        apply_wait us/commit
+#   B (n=3)        903.9         104,584                      1234   spread 6.12%
+#   W  4 cores     905.3         122,909 (+17.5%)             1391   (+12.7%)
+#   WA 3 cores     891.6         116,582                      1305
+#   W5 5 cores     880.0         131,294                      1268
+# Throughput flat (nothing resolves against a 6.12% bracket) but the MECHANISM
+# went the OTHER WAY, tightly: the two W segments agree on involuntary/s to
+# 0.27%. Per-thread preemption ROSE on every compute-bound group -- read-pool
+# +27.2%, ublk-io-worker +21.0%, flusher-dedup +18.2%, compress +18.6%,
+# persistent-slot +16.6% -- because a fence does not only park the waiters, it
+# also TAKES 8 CPUs AWAY FROM THE BUSY SIDE. Total demand was unchanged (~68
+# mean runnable); only its placement moved.
+#
+# ⭐⭐⭐ Both directions of static partitioning are now measured and both lose:
+# dedicating to a busy role (lv2/lv3 above) and fencing the idle ones. At 1.55x
+# oversubscription, "reserve a set that is nearly fully used" is NECESSARY BUT
+# NOT SUFFICIENT. The lever is reducing demand, not placing it. Keep at 0.
+#
+# Arms: tools/core_budget_ab.sh (W / W5 / WA), flipped over the `cores` IPC --
+# no restart and no config rewrite, so this file stays at 0.
+wait_class_cores = 0
+# Which groups wait_class_cores applies to: comma list of metadb-apply, metaio,
+# flusher-writer, flusher-post-commit, or "all"/empty. Ignored when 0.
+wait_class_groups = "all"

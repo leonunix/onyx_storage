@@ -1201,30 +1201,32 @@ impl ServiceController {
                 // ⚠ Wait ~10 s after a flip before opening a measurement
                 // window; tools/core_budget_ab.sh does.
                 //
-                // Only the three core parameters are settable. The rebuild
+                // Only the core-count parameters are settable. The rebuild
                 // reads the config SNAPSHOT taken at confine setup, never the
                 // file on disk, because the restart-per-arm harness rewrites
                 // that file (see numa::CONFINE_CONFIG).
+                //
+                // ⚠ Parsed off `cmd` rather than `parts`, which is a
+                // `splitn(4, ' ')` and therefore leaves everything from the
+                // third argument on in one string.
                 #[cfg(target_os = "linux")]
                 "cores" => {
-                    if parts.len() >= 4 {
-                        let parsed = parts[1]
-                            .parse::<usize>()
-                            .and_then(|lv2| parts[2].parse::<usize>().map(|lv3| (lv2, lv3)))
-                            .and_then(|(lv2, lv3)| {
-                                parts[3]
-                                    .trim()
-                                    .parse::<usize>()
-                                    .map(|rsv| (lv2, lv3, rsv))
-                            });
-                        match parsed {
-                            Ok((lv2, lv3, rsv)) => {
-                                match crate::numa::apply_confine_budget(lv2, lv3, rsv) {
+                    const CORES_USAGE: &[u8] = b"error: usage: cores [<lv2_cores> <lv3_cores> \
+                        <reserve_cores> [<wait_class_cores> [<wait_class_groups>]]]\n";
+                    let args: Vec<&str> = cmd.split_whitespace().skip(1).collect();
+                    if !args.is_empty() {
+                        match parse_cores_args(&args) {
+                            Some((lv2, lv3, rsv, wait, groups)) => {
+                                match crate::numa::apply_confine_budget(
+                                    lv2, lv3, rsv, wait, groups,
+                                ) {
                                     Ok(summary) => {
                                         tracing::info!(
                                             requested_lv2 = lv2,
                                             requested_lv3 = lv3,
                                             requested_reserve = rsv,
+                                            requested_wait_class = ?wait,
+                                            requested_wait_groups = ?groups,
                                             effective = %summary,
                                             "core budget swapped"
                                         );
@@ -1237,20 +1239,12 @@ impl ServiceController {
                                     }
                                 }
                             }
-                            Err(_) => {
-                                let _ = stream.write_all(
-                                    b"error: usage: cores [<lv2_cores> <lv3_cores> <reserve_cores>]\n",
-                                );
+                            None => {
+                                let _ = stream.write_all(CORES_USAGE);
                                 let _ = stream.flush();
                                 continue;
                             }
                         }
-                    } else if parts.len() != 1 {
-                        let _ = stream.write_all(
-                            b"error: usage: cores [<lv2_cores> <lv3_cores> <reserve_cores>]\n",
-                        );
-                        let _ = stream.flush();
-                        continue;
                     }
                     // Echo what is actually in force, so an arm can self-prove
                     // off the LIVE object rather than off the config it wrote.
@@ -2092,6 +2086,74 @@ pub fn send_volume_usage(socket_path: &Path, volume: &str) -> OnyxResult<String>
 pub fn send_mode_command(socket_path: &Path) -> OnyxResult<String> {
     let lines = send_ipc_command(socket_path, "mode")?;
     Ok(lines.into_iter().find(|l| l != "ok").unwrap_or_default())
+}
+
+/// Parse the arguments of the `cores` IPC command:
+/// `<lv2> <lv3> <reserve> [<wait_class_cores> [<wait_class_groups>]]`.
+///
+/// Pulled out of the handler as a pure function so the one path an A/B arm
+/// cannot self-prove — a typo here answers `usage:` and the arm aborts before
+/// it measures anything, which is safe but costs a box run — is covered by a
+/// unit test instead.
+///
+/// `None` for `wait` means "not asked about": the fence is inherited from the
+/// config rather than disarmed, so the pre-fence 3-argument form cannot
+/// silently remove a configured fence.
+#[allow(clippy::type_complexity)]
+fn parse_cores_args<'a>(
+    args: &[&'a str],
+) -> Option<(usize, usize, usize, Option<usize>, Option<&'a str>)> {
+    if !(3..=5).contains(&args.len()) {
+        return None;
+    }
+    let lv2 = args[0].parse::<usize>().ok()?;
+    let lv3 = args[1].parse::<usize>().ok()?;
+    let reserve = args[2].parse::<usize>().ok()?;
+    let wait = match args.get(3) {
+        Some(a) => Some(a.parse::<usize>().ok()?),
+        None => None,
+    };
+    Some((lv2, lv3, reserve, wait, args.get(4).copied()))
+}
+
+#[cfg(test)]
+mod cores_command_tests {
+    use super::*;
+
+    #[test]
+    fn the_pre_fence_three_argument_form_leaves_the_fence_alone() {
+        assert_eq!(
+            parse_cores_args(&["0", "0", "2"]),
+            Some((0, 0, 2, None, None)),
+            "3 args must parse with wait = None (inherit), not Some(0) (disarm)"
+        );
+    }
+
+    #[test]
+    fn the_fence_and_its_group_list_are_optional_in_that_order() {
+        assert_eq!(
+            parse_cores_args(&["0", "0", "2", "4"]),
+            Some((0, 0, 2, Some(4), None))
+        );
+        assert_eq!(
+            parse_cores_args(&["5", "2", "0", "3", "metadb-apply,metaio"]),
+            Some((5, 2, 0, Some(3), Some("metadb-apply,metaio")))
+        );
+    }
+
+    #[test]
+    fn a_malformed_request_is_rejected_rather_than_partly_applied() {
+        for args in [
+            vec!["0"],
+            vec!["0", "0"],
+            vec!["0", "0", "2", "4", "all", "extra"],
+            vec!["0", "0", "two"],
+            vec!["0", "0", "2", "four"],
+            vec!["0", "0", "2", "-1"],
+        ] {
+            assert_eq!(parse_cores_args(&args), None, "{args:?} must not parse");
+        }
+    }
 }
 
 #[cfg(test)]

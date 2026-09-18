@@ -164,6 +164,78 @@ pub struct CoresConfig {
     /// from the OS reserve stops the reservation being purely zero-sum.
     #[serde(default)]
     pub lv2_dedicated_cores: usize,
+    /// Physical cores the **wait class** is fenced onto
+    /// ([`crate::affinity::WaitClassGroup`]). `0` (default) leaves every one of
+    /// those groups in the shared background set, i.e. the shipped behaviour.
+    ///
+    /// This is the INVERSE of the two knobs above, and the reason it exists is
+    /// that both of them lost. Box census 2026-09-18, 310 threads / 44 confined
+    /// cores: total demand is **70.5 mean-runnable CPUs**, so handing cores to a
+    /// busy role cannot create capacity — it converts shared capacity into
+    /// private *idle* capacity, which is exactly what the LV2 arm measured
+    /// (preemption −66% on the beneficiary, total involuntary −13%, throughput
+    /// **−2.5%**; memory `lv2_dedication_throughput_retracted`).
+    ///
+    /// The distribution says where the slack actually is: **176 of 310 threads
+    /// (57%) ask for 19.49 CPUs between them**, at 5-8% per-thread duty, because
+    /// they are sized for *concurrency* — each must be able to block without
+    /// holding up the thread behind it. Scattered over all 44 CPUs they only
+    /// preempt the stages that compute (`read-pool` 73% duty, `ublk-io-worker`
+    /// 47%, `flusher-dedup/compress` ~41%). Fencing the four groups in
+    /// [`crate::affinity::WaitClassGroup::ALL`] puts **120 threads at 7.67 mean
+    /// runnable** onto 4 physical cores (8 logical, ~96% utilised) and takes
+    /// them off the runqueues of the other 36.
+    ///
+    /// ⛔⛔ **MEASURED VERDICT (box 2026-09-18, 7 interleaved segments in one
+    /// process, QD256 j16d16 randrw 70/30 — memory
+    /// `wait_class_fence_raises_total_preemption`): the fence WORKS and the
+    /// hypothesis is FALSIFIED.** All 120 threads confine correctly and the
+    /// fenced set ran **91% utilised** — the criterion the LV2 retraction said
+    /// to size by — and it still lost:
+    ///
+    /// ```text
+    /// arm              MiB/s   involuntary/s   apply_wait us/commit
+    /// B (n=3)          903.9         104,584                   1234   spread 6.12%
+    /// W  4 cores       905.3         122,909  (+17.5%)         1391   (+12.7%)
+    /// WA 3 cores       891.6         116,582                   1305
+    /// W5 5 cores       880.0         131,294                   1268
+    /// ```
+    ///
+    /// Throughput is flat (no arm resolves against a 6.12% bracket), but the
+    /// mechanism moved **the opposite way** and it is tight — the two W
+    /// segments agree on involuntary/s to 0.27%, versus a 6% spread among the
+    /// B segments. Per-thread preemption ROSE on every compute-bound group:
+    /// `read-pool` +27.2%, `read-pool-fg` +22.5%, `ublk-io-worker` +21.0%,
+    /// `flusher-dedup` +18.2%, `flusher-compress` +18.6%, `persistent-slot`
+    /// +16.6%. The fenced groups themselves mostly improved
+    /// (`flusher-post-commit` −52.7%, `flusher-writer` −18.7%) except `metaio`
+    /// (+43.6%, 32 threads crowded onto 8 CPUs).
+    ///
+    /// ⭐⭐⭐ **The rule this settles, and it is stronger than the one it
+    /// replaces**: a fence does not only park the waiters, it also *takes CPUs
+    /// away from the busy side*. At 68/44 = 1.55× oversubscription the 8 CPUs
+    /// cost the workers more than the interference they removed — total demand
+    /// (`mean runnable`) was unchanged at ~68, only its placement moved. So
+    /// "size a reservation so its set is nearly fully used" is **necessary but
+    /// not sufficient**: on an oversubscribed box NO static CPU partition pays,
+    /// in either direction. Both directions are now measured — dedicating to a
+    /// busy role (LV2/LV3) and fencing the idle ones. The remaining lever is
+    /// reducing demand, not placing it.
+    ///
+    /// ⚠ The apply lanes did pay the predicted cost: `apply_wait` +12.7%
+    /// per commit under the full fence. Judge that BEFORE host MiB/s on any
+    /// future arm — a commit needs every touched shard's lane started.
+    #[serde(default)]
+    pub wait_class_cores: usize,
+    /// Which wait-class groups `wait_class_cores` applies to: a comma list of
+    /// `metadb-apply`, `metaio`, `flusher-writer`, `flusher-post-commit`, or
+    /// `all` (the default). Ignored when `wait_class_cores = 0`.
+    ///
+    /// Settable per-arm over the `cores` IPC command, because the groups differ
+    /// in risk rather than in kind and the subset that pays is an empirical
+    /// question — not one worth a restart per answer.
+    #[serde(default)]
+    pub wait_class_groups: String,
 }
 
 impl Default for CoresConfig {
@@ -171,6 +243,8 @@ impl Default for CoresConfig {
         Self {
             lv3_dedicated_cores: 0,
             lv2_dedicated_cores: 0,
+            wait_class_cores: 0,
+            wait_class_groups: String::new(),
         }
     }
 }
@@ -3043,6 +3117,45 @@ mod service_config_tests {
         let config: OnyxConfig = toml::from_str("").unwrap();
         assert_eq!(config.cores.lv3_dedicated_cores, 0);
         assert_eq!(config.cores.lv2_dedicated_cores, 0);
+        // The wait-class fence is off by default too, so `[cores]`-less
+        // configs keep every group in the shared set.
+        assert_eq!(config.cores.wait_class_cores, 0);
+        assert!(config.cores.wait_class_groups.is_empty());
+    }
+
+    /// The fence's group list is a subset knob, and an empty string has to mean
+    /// "all four" — otherwise setting only `wait_class_cores` would fence
+    /// nothing while reporting a fence.
+    #[test]
+    fn wait_class_fence_knobs_deserialize_and_default_to_all_groups() {
+        let config: OnyxConfig = toml::from_str(
+            r#"
+                [cores]
+                wait_class_cores = 4
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.cores.wait_class_cores, 4);
+        assert_eq!(
+            crate::affinity::parse_wait_class_groups(&config.cores.wait_class_groups).unwrap(),
+            crate::affinity::WaitClassGroup::ALL.to_vec()
+        );
+
+        let subset: OnyxConfig = toml::from_str(
+            r#"
+                [cores]
+                wait_class_cores = 3
+                wait_class_groups = "metadb-apply,metaio"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            crate::affinity::parse_wait_class_groups(&subset.cores.wait_class_groups).unwrap(),
+            vec![
+                crate::affinity::WaitClassGroup::MetadbApply,
+                crate::affinity::WaitClassGroup::MetaIo
+            ]
+        );
     }
 
     #[test]

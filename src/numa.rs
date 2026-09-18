@@ -809,12 +809,7 @@ fn setup_confine(config: &crate::config::OnyxConfig) -> crate::error::OnyxResult
             "failed to confine main thread to node {home} background cpus {background_cpus:?}: {err}"
         )));
     }
-    let build = build_confine_budget(
-        config,
-        config.cores.lv2_dedicated_cores,
-        config.cores.lv3_dedicated_cores,
-        config.numa.reserve_cores_per_node,
-    )?;
+    let build = build_confine_budget(config, &CoreBudgetRequest::from_config(config)?)?;
     build.log("numa confine active (in-engine numactl equivalent; ublk queue threads included)");
     crate::affinity::init_confine(build.budget);
     // Snapshot for the runtime `cores` rebuild; see CONFINE_CONFIG.
@@ -844,12 +839,23 @@ impl ConfineBudgetBuild {
             .into_iter()
             .map(|(role, role_cpus)| (format!("{role:?}"), role_cpus.to_vec()))
             .collect();
+        // The fence is NOT in `dedications()` (it would print once per member
+        // role); log it as its own field or it would be invisible at startup.
+        let (wait_fence, wait_groups) = match self.budget.wait_fence() {
+            None => (Vec::new(), Vec::new()),
+            Some((cpus, groups)) => (
+                cpus.to_vec(),
+                groups.iter().map(|g| g.name()).collect::<Vec<_>>(),
+            ),
+        };
         tracing::info!(
             home_node = self.home,
             engine_cpus = ?self.engine_cpus,
             foreground_cpus = ?self.budget.foreground_cpus(),
             background_cpus = ?self.budget.background_cpus(),
             dedicated = ?dedications,
+            wait_fence = ?wait_fence,
+            wait_groups = ?wait_groups,
             direct_io_cpus = ?self.direct_io_cpus,
             reserved_cores = self.reserved_cores,
             "{}",
@@ -860,18 +866,38 @@ impl ConfineBudgetBuild {
     /// One line an A/B arm can grep to prove what the engine actually applied,
     /// in the shape the IPC caller echoes back.
     pub(crate) fn summary(&self) -> String {
-        let dedications: Vec<String> = self
-            .budget
-            .dedications()
-            .into_iter()
-            .map(|(role, role_cpus)| format!("{role:?}={role_cpus:?}"))
-            .collect();
         format!(
-            "reserved_cores={} engine_cpus={} dedicated=[{}]",
+            "reserved_cores={} engine_cpus={} dedicated=[{}] {}",
             self.reserved_cores,
             self.engine_cpus.len(),
-            dedications.join(",")
+            budget_dedications(&self.budget).join(","),
+            budget_wait_fence(&self.budget),
         )
+    }
+}
+
+fn budget_dedications(budget: &crate::affinity::CoreBudget) -> Vec<String> {
+    budget
+        .dedications()
+        .into_iter()
+        .map(|(role, role_cpus)| format!("{role:?}={role_cpus:?}"))
+        .collect()
+}
+
+/// The fence half of the self-proof line. Always printed, including as
+/// `wait_fence=[]`, so an arm that expects NO fence can assert on the same
+/// token as one that expects a fence instead of on its absence.
+fn budget_wait_fence(budget: &crate::affinity::CoreBudget) -> String {
+    match budget.wait_fence() {
+        None => "wait_fence=[] wait_groups=".to_string(),
+        Some((cpus, groups)) => format!(
+            "wait_fence={cpus:?} wait_groups={}",
+            groups
+                .iter()
+                .map(|g| g.name())
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
     }
 }
 
@@ -885,10 +911,9 @@ impl ConfineBudgetBuild {
 /// engine is not something an A/B arm should do.
 pub(crate) fn build_confine_budget(
     config: &crate::config::OnyxConfig,
-    lv2_cores: usize,
-    lv3_cores: usize,
-    reserve_cores: usize,
+    request: &CoreBudgetRequest,
 ) -> crate::error::OnyxResult<ConfineBudgetBuild> {
+    let reserve_cores = request.reserve_cores;
     let topo = NumaTopology::detect();
     let home = config.numa.home_node;
     let Some(node) = topo.node(home) else {
@@ -910,8 +935,20 @@ pub(crate) fn build_confine_budget(
     // LV2 first: it is the larger claim, and `dedicate` only hands out cores
     // still in the role's shared half, so the order decides who gets the
     // contiguous block nearest the OS reserve when both are set.
-    budget.dedicate(crate::affinity::ThreadRole::BufferSync, &node.cores, lv2_cores)?;
-    budget.dedicate(crate::affinity::ThreadRole::Lv3Batch, &node.cores, lv3_cores)?;
+    budget.dedicate(
+        crate::affinity::ThreadRole::BufferSync,
+        &node.cores,
+        request.lv2_cores,
+    )?;
+    budget.dedicate(
+        crate::affinity::ThreadRole::Lv3Batch,
+        &node.cores,
+        request.lv3_cores,
+    )?;
+    // The wait-class fence claims LAST, so a given lv2/lv3 value lands on the
+    // same CPUs whether or not a fence is armed — two arms of one A/B must
+    // differ in the knob under test and nothing else.
+    budget.fence_wait_class(&node.cores, request.wait_cores, &request.wait_groups)?;
     Ok(ConfineBudgetBuild {
         budget,
         home,
@@ -919,6 +956,41 @@ pub(crate) fn build_confine_budget(
         direct_io_cpus,
         reserved_cores: reserve_cores,
     })
+}
+
+/// The core-count parameters of a confine budget — everything an A/B arm may
+/// change at runtime, and nothing else.
+///
+/// A struct rather than five positional `usize`s because `cores 0 0 2 4` is
+/// already hard enough to read on a command line; at the call site the names
+/// have to survive.
+#[derive(Clone, Debug)]
+pub(crate) struct CoreBudgetRequest {
+    pub lv2_cores: usize,
+    pub lv3_cores: usize,
+    pub reserve_cores: usize,
+    pub wait_cores: usize,
+    pub wait_groups: Vec<crate::affinity::WaitClassGroup>,
+}
+
+impl CoreBudgetRequest {
+    /// The shipped budget: whatever `[cores]` and `[numa]` ask for.
+    pub(crate) fn from_config(
+        config: &crate::config::OnyxConfig,
+    ) -> crate::error::OnyxResult<Self> {
+        Ok(Self {
+            lv2_cores: config.cores.lv2_dedicated_cores,
+            lv3_cores: config.cores.lv3_dedicated_cores,
+            reserve_cores: config.numa.reserve_cores_per_node,
+            wait_cores: config.cores.wait_class_cores,
+            wait_groups: crate::affinity::parse_wait_class_groups(
+                &config.cores.wait_class_groups,
+            )
+            .map_err(|e| {
+                crate::error::OnyxError::Config(format!("cores.wait_class_groups: {e}"))
+            })?,
+        })
+    }
 }
 
 /// The config confine was set up with.
@@ -942,19 +1014,13 @@ static CONFINE_RESERVED_CORES: std::sync::atomic::AtomicUsize =
 pub(crate) fn confine_budget_summary() -> String {
     crate::affinity::with_confine_budget(|budget| match budget {
         None => "inactive (numa.mode is not \"confine\")".to_string(),
-        Some(budget) => {
-            let dedications: Vec<String> = budget
-                .dedications()
-                .into_iter()
-                .map(|(role, cpus)| format!("{role:?}={cpus:?}"))
-                .collect();
-            format!(
-                "reserved_cores={} engine_cpus={} dedicated=[{}]",
-                CONFINE_RESERVED_CORES.load(std::sync::atomic::Ordering::Relaxed),
-                budget.engine_cpus().len(),
-                dedications.join(",")
-            )
-        }
+        Some(budget) => format!(
+            "reserved_cores={} engine_cpus={} dedicated=[{}] {}",
+            CONFINE_RESERVED_CORES.load(std::sync::atomic::Ordering::Relaxed),
+            budget.engine_cpus().len(),
+            budget_dedications(budget).join(","),
+            budget_wait_fence(budget),
+        ),
     })
 }
 
@@ -967,13 +1033,39 @@ pub(crate) fn apply_confine_budget(
     lv2_cores: usize,
     lv3_cores: usize,
     reserve_cores: usize,
+    wait_cores: Option<usize>,
+    wait_groups: Option<&str>,
 ) -> crate::error::OnyxResult<String> {
     let Some(config) = CONFINE_CONFIG.get() else {
         return Err(crate::error::OnyxError::Config(
             "numa confine is not active; there is no core budget to rebuild".to_string(),
         ));
     };
-    let build = build_confine_budget(config, lv2_cores, lv3_cores, reserve_cores)?;
+    // `None` = not asked about, so inherit the config rather than disarm: a
+    // three-argument `cores` call predates the fence and must not silently
+    // remove one that the config armed. Both cases are visible in the summary
+    // line the caller echoes back.
+    let wait_cores = wait_cores.unwrap_or(config.cores.wait_class_cores);
+    // An arm that names no groups inherits the config's list, so
+    // `cores <lv2> <lv3> <reserve> <wait>` stays a two-value decision.
+    let wait_groups = match wait_groups {
+        Some(spec) => crate::affinity::parse_wait_class_groups(spec)
+            .map_err(crate::error::OnyxError::Config)?,
+        None => crate::affinity::parse_wait_class_groups(&config.cores.wait_class_groups)
+            .map_err(|e| {
+                crate::error::OnyxError::Config(format!("cores.wait_class_groups: {e}"))
+            })?,
+    };
+    let build = build_confine_budget(
+        config,
+        &CoreBudgetRequest {
+            lv2_cores,
+            lv3_cores,
+            reserve_cores,
+            wait_cores,
+            wait_groups,
+        },
+    )?;
     let summary = build.summary();
     // ⚠ chunklet's uring execution pool copies `role_cpu_set()` at pool build
     // time, so its workers keep the CPUs they were born with. Disabled on the

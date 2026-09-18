@@ -253,7 +253,8 @@ enum Command {
     /// stray-thread enforcer within two 5 s sweeps — ⚠ wait ~10 s after a flip
     /// before opening a measurement window (tools/core_budget_ab.sh does).
     ///
-    /// All three arguments together, or none to just read what is in force.
+    /// The first three arguments together, or none to just read what is in
+    /// force; `wait` and `groups` are optional on top of them.
     Cores {
         /// Physical cores dedicated to the LV2 sync threads.
         lv2: Option<usize>,
@@ -261,6 +262,13 @@ enum Command {
         lv3: Option<usize>,
         /// Physical cores withheld per node for the OS / IRQs.
         reserve: Option<usize>,
+        /// Physical cores the wait class is fenced onto (`cores.wait_class_cores`).
+        /// Omitted = leave whatever the config asked for; 0 = no fence.
+        wait: Option<usize>,
+        /// Wait-class groups to fence: comma list of `metadb-apply`, `metaio`,
+        /// `flusher-writer`, `flusher-post-commit`, or `all`. Omitted = the
+        /// config's `cores.wait_class_groups`.
+        groups: Option<String>,
     },
     /// Read or set chunklet's RAID6 pipelined writer (`raid6_pipeline_window_stripes`).
     ///
@@ -1426,7 +1434,15 @@ fn main() -> anyhow::Result<()> {
                 println!("{line}");
             }
         }
-        Command::Cores { lv2, lv3, reserve } => {
+        Command::Cores {
+            lv2,
+            lv3,
+            reserve,
+            wait,
+            groups,
+        } => {
+            // `wait` before `groups` is enforced by their positional order:
+            // clap will not accept a group list with no core count.
             let sock = &config.service.socket_path;
             if !sock.exists() {
                 anyhow::bail!(
@@ -1437,9 +1453,19 @@ fn main() -> anyhow::Result<()> {
             }
             let cmd = match (lv2, lv3, reserve) {
                 (None, None, None) => "cores".to_string(),
-                (Some(a), Some(b), Some(c)) => format!("cores {a} {b} {c}"),
+                (Some(a), Some(b), Some(c)) => {
+                    let mut cmd = format!("cores {a} {b} {c}");
+                    if let Some(w) = wait {
+                        cmd.push_str(&format!(" {w}"));
+                    }
+                    if let Some(g) = &groups {
+                        cmd.push_str(&format!(" {g}"));
+                    }
+                    cmd
+                }
                 _ => anyhow::bail!(
-                    "cores takes all three arguments (<lv2> <lv3> <reserve>) or none"
+                    "cores takes at least the first three arguments (<lv2> <lv3> <reserve>) \
+                     or none"
                 ),
             };
             for line in service::send_chunklet_command(sock, &cmd)? {
