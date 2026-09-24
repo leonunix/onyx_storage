@@ -27,17 +27,36 @@ use crate::volume::{OnyxVolume, VolumeWriteTicket};
 use crate::worker_queue::WorkerQueue;
 
 pub const DIRECT_IO_MAGIC: [u8; 4] = *b"ONIO";
-pub const DIRECT_IO_VERSION: u16 = 2;
+pub const DIRECT_IO_VERSION: u16 = 3;
 pub const REQUEST_HEADER_LEN: usize = 48;
 pub const RESPONSE_HEADER_LEN: usize = 96;
-pub const MAX_DIRECT_IO_BYTES: usize = BLOCK_SIZE as usize;
+/// Largest single IO the protocol accepts, in bytes.
+///
+/// The engine itself has no such limit — `OnyxVolume::write_aligned_deferred`
+/// and `read_into` both take an arbitrary block-aligned length and let
+/// `ZoneManager` fan it across zones — so this is purely a bound on how much
+/// memory one session may pin.  A session keeps its request payload buffers
+/// alive for as long as the requests are outstanding, so the worst case is
+/// `MAX_DIRECT_IO_SESSIONS * MAX_DIRECT_IO_OUTSTANDING * MAX_DIRECT_IO_BYTES`
+/// ≈ 2 GiB at 64 sessions each at QD256.  The canonical box profile (16 jobs
+/// at QD16, `bs=4k-32k`) reaches ~32 MiB of that.  Do the multiplication again
+/// before raising it.
+pub const MAX_DIRECT_IO_BYTES: usize = 128 * 1024;
 pub const MAX_DIRECT_IO_OUTSTANDING: usize = 256;
 pub const MAX_VOLUME_NAME_BYTES: usize = 255;
+/// Bytes of [`HelloCapability`] that follow a successful `HELLO` response.
+pub const HELLO_CAPABILITY_LEN: usize = 16;
+
+// An IO length is validated as a multiple of BLOCK_SIZE *and* within this
+// bound; a ceiling that is not itself a whole number of blocks would make the
+// largest accepted IO smaller than the constant claims.
+const _: () = assert!(MAX_DIRECT_IO_BYTES % BLOCK_SIZE as usize == 0);
 
 pub const OP_HELLO: u16 = 1;
 pub const OP_WRITE: u16 = 2;
 pub const OP_READ: u16 = 3;
 pub const OP_CLOSE: u16 = 4;
+pub const OP_TRIM: u16 = 5;
 
 const MAX_DIRECT_IO_SESSIONS: usize = 64;
 const IO_POLL_TIMEOUT: Duration = Duration::from_millis(100);
@@ -263,6 +282,59 @@ impl ResponseHeader {
             response_queue_ns: u64::from_le_bytes(buf[80..88].try_into().unwrap()),
             server_send_ns: u64::from_le_bytes(buf[88..96].try_into().unwrap()),
         })
+    }
+}
+
+/// The payload that follows a successful `HELLO` response.
+///
+/// Protocol 2 had no way to report any of this, which forced every client to
+/// be told the geometry out of band: `fio` jobs had to carry a `size=` (a
+/// wrong one silently changes the LBA span, and with it the dedup and
+/// locality behaviour of the run), and "does this client agree with this
+/// engine about the IO limits" was answerable only by the convention that
+/// both were built from the same tree.  Reporting it makes the session
+/// self-describing, so a version match is sufficient and a limit mismatch is
+/// a clear error at `HELLO` instead of an `EINVAL` on the first IO.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HelloCapability {
+    /// Size of the opened volume in bytes.
+    pub capacity_bytes: u64,
+    /// IO granularity; every offset and length must be a multiple of it.
+    pub block_size: u32,
+    /// Largest single IO this engine accepts — [`MAX_DIRECT_IO_BYTES`].
+    pub max_io_bytes: u32,
+}
+
+impl HelloCapability {
+    pub fn encode(self) -> [u8; HELLO_CAPABILITY_LEN] {
+        let mut out = [0u8; HELLO_CAPABILITY_LEN];
+        out[0..8].copy_from_slice(&self.capacity_bytes.to_le_bytes());
+        out[8..12].copy_from_slice(&self.block_size.to_le_bytes());
+        out[12..16].copy_from_slice(&self.max_io_bytes.to_le_bytes());
+        out
+    }
+
+    pub fn decode(buf: &[u8]) -> io::Result<Self> {
+        if buf.len() < HELLO_CAPABILITY_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "direct IO HELLO capability payload is short",
+            ));
+        }
+        Ok(Self {
+            capacity_bytes: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
+            block_size: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
+            max_io_bytes: u32::from_le_bytes(buf[12..16].try_into().unwrap()),
+        })
+    }
+
+    /// What this build reports for `volume`.
+    fn of(volume: &OnyxVolume) -> Self {
+        Self {
+            capacity_bytes: volume.size_bytes(),
+            block_size: BLOCK_SIZE,
+            max_io_bytes: MAX_DIRECT_IO_BYTES as u32,
+        }
     }
 }
 
@@ -837,10 +909,12 @@ struct SubmitTask {
     queued_at: StageInstant,
     intake_ns: u64,
     pending_tx: Sender<PendingWrite>,
-    /// Header-only responses (write acks, errors, close) — the fast lane.
+    /// Header-only responses (write and trim acks, errors, close) — the fast
+    /// lane.
     ack_tx: Sender<Outbound>,
-    /// Read completions, which carry a 4 KiB payload — see `writer_loop`'s
-    /// doc comment for why these are kept off the ack lane.
+    /// Read completions, which carry a payload of up to
+    /// [`MAX_DIRECT_IO_BYTES`] — see `writer_loop`'s doc comment for why
+    /// these are kept off the ack lane.
     payload_tx: Sender<Outbound>,
     recycle_tx: Sender<Vec<u8>>,
 }
@@ -922,7 +996,7 @@ fn handle_session(
 
     if write_response(
         &mut stream,
-        &mut Outbound::header_only(
+        &mut Outbound::new(
             response(
                 OP_HELLO,
                 hello.request_id,
@@ -930,6 +1004,7 @@ fn handle_session(
                 lane_worker_count as u32,
                 StageTimings::default(),
             ),
+            HelloCapability::of(&volume).encode().to_vec(),
             false,
         ),
     )
@@ -1043,9 +1118,12 @@ fn handle_session(
             continue;
         }
         match header.opcode {
-            OP_WRITE | OP_READ => {
+            OP_WRITE | OP_READ | OP_TRIM => {
                 if header.io_len as usize > MAX_DIRECT_IO_BYTES
                     || header.offset.checked_add(header.io_len as u64).is_none()
+                    // A trim carries no data; refusing a payload here keeps
+                    // the bytes already read off the submit lane entirely.
+                    || (header.opcode == OP_TRIM && header.payload_len != 0)
                 {
                     send_error(
                         &ack_tx,
@@ -1199,6 +1277,7 @@ fn submit_worker_loop(input: Receiver<SubmitTask>) {
         match task.header.opcode {
             OP_WRITE => handle_submit_write(task, stages),
             OP_READ => handle_submit_read(task, stages),
+            OP_TRIM => handle_submit_trim(task, stages),
             _ => unreachable!("only IO requests enter direct IO submit lanes"),
         }
     }
@@ -1207,6 +1286,7 @@ fn submit_worker_loop(input: Receiver<SubmitTask>) {
 fn handle_submit_write(mut task: SubmitTask, mut stages: StageTimings) {
     let header = task.header;
     if header.io_len == 0
+        || header.io_len as usize > MAX_DIRECT_IO_BYTES
         || header.payload_len != header.io_len
         || task.payload.len() != header.io_len as usize
         || header.offset % BLOCK_SIZE as u64 != 0
@@ -1305,6 +1385,58 @@ fn handle_submit_read(mut task: SubmitTask, mut stages: StageTimings) {
             let _ = task.payload_tx.send(Outbound::new(
                 response(OP_READ, header.request_id, 0, header.io_len, stages),
                 data,
+                true,
+            ));
+        }
+        Err(error) => send_error(
+            &task.ack_tx,
+            &header,
+            status_from_error(&error),
+            task.server_started,
+            stages,
+            true,
+        ),
+    }
+}
+
+/// Discard a block-aligned range.
+///
+/// This is the same `OnyxVolume::discard` the ublk frontend's
+/// `handle_discard` calls, so the PBA lifecycle behind it is the already-live
+/// path — nothing here reaches into retire/reclaim itself.  It completes
+/// synchronously and acks on the header-only lane: unlike a write there is no
+/// LV2 sequence to park on, so it never enters the durability ring.
+fn handle_submit_trim(mut task: SubmitTask, mut stages: StageTimings) {
+    let header = task.header;
+    let payload = std::mem::take(&mut task.payload);
+    let empty_request = header.payload_len == 0 && payload.is_empty();
+    let _ = task.recycle_tx.try_send(payload);
+    if !empty_request
+        || header.io_len == 0
+        || header.io_len as usize > MAX_DIRECT_IO_BYTES
+        || header.offset % BLOCK_SIZE as u64 != 0
+        || header.io_len % BLOCK_SIZE != 0
+    {
+        send_error(
+            &task.ack_tx,
+            &header,
+            -libc::EINVAL,
+            task.server_started,
+            stages,
+            true,
+        );
+        return;
+    }
+
+    let submit_started = StageInstant::now();
+    let result = task.volume.discard(header.offset, header.io_len as u64);
+    stages.engine_submit_ns = submit_started.elapsed().as_nanos() as u64;
+    match result {
+        Ok(()) => {
+            stages.server_total_ns = task.server_started.elapsed().as_nanos() as u64;
+            let _ = task.ack_tx.send(Outbound::new(
+                response(OP_TRIM, header.request_id, 0, header.io_len, stages),
+                Vec::new(),
                 true,
             ));
         }
@@ -1532,12 +1664,13 @@ fn write_and_clear(
     true
 }
 
-/// Drains `ack` (header-only: write completions, errors, close) ahead of
-/// `payload` (read completions, which carry a 4 KiB body) whenever both are
-/// ready.
+/// Drains `ack` (header-only: write and trim completions, errors, close)
+/// ahead of `payload` (read completions, which carry the read body) whenever
+/// both are ready.
 ///
 /// Both lanes funnel into ONE socket via one thread, so without this split a
-/// read's payload write — several times the byte count of an ack — can sit
+/// read's payload write — up to `MAX_DIRECT_IO_BYTES`, i.e. orders of
+/// magnitude the byte count of an ack — can sit
 /// ahead of an already-ready write ack in strict arrival order. That ack is
 /// what lets the CLIENT reuse the fio slot the completed write occupied,
 /// so delaying it throttles the client's effective queue depth on every
@@ -1645,10 +1778,12 @@ fn response(
         status,
         request_id,
         bytes,
-        payload_len: if opcode == OP_READ && status == 0 {
-            bytes
-        } else {
-            0
+        // Every response header is built here, so the payload-bearing opcodes
+        // are enumerated in exactly one place.
+        payload_len: match opcode {
+            OP_READ if status == 0 => bytes,
+            OP_HELLO if status == 0 => HELLO_CAPABILITY_LEN as u32,
+            _ => 0,
         },
         server_total_ns: stages.server_total_ns,
         submit_queue_ns: stages.submit_queue_ns,
@@ -1755,9 +1890,66 @@ mod tests {
             client_submit_ns: 0x2122_2324_2526_2728,
         };
         let encoded = header.encode();
-        assert_eq!(&encoded[0..8], b"ONIO\x02\x00\x02\x00");
+        assert_eq!(&encoded[0..8], b"ONIO\x03\x00\x02\x00");
         assert_eq!(&encoded[36..40], &[0; 4], "reserved stays zero");
         assert_eq!(RequestHeader::decode(&encoded).unwrap(), header);
+    }
+
+    #[test]
+    fn hello_capability_round_trips_little_endian() {
+        let capability = HelloCapability {
+            capacity_bytes: 0x0102_0304_0506_0708,
+            block_size: BLOCK_SIZE,
+            max_io_bytes: MAX_DIRECT_IO_BYTES as u32,
+        };
+        let encoded = capability.encode();
+        assert_eq!(encoded.len(), HELLO_CAPABILITY_LEN);
+        assert_eq!(&encoded[0..8], &0x0102_0304_0506_0708u64.to_le_bytes());
+        assert_eq!(HelloCapability::decode(&encoded).unwrap(), capability);
+        // A client that reads only part of the payload must be told, not
+        // handed a value assembled from whatever followed in its buffer.
+        assert!(HelloCapability::decode(&encoded[..HELLO_CAPABILITY_LEN - 1]).is_err());
+    }
+
+    /// A successful HELLO is the ONLY non-read response with a payload, and
+    /// the length must come from the same funnel every other response uses —
+    /// a client that reads `RESPONSE_HEADER_LEN` and then starts issuing IO
+    /// would desynchronise on a payload it was not told about.
+    #[test]
+    fn hello_response_advertises_the_capability_payload_and_errors_do_not() {
+        let ok = response(OP_HELLO, 7, 0, 32, StageTimings::default());
+        assert_eq!(ok.payload_len, HELLO_CAPABILITY_LEN as u32);
+        assert_eq!(ok.bytes, 32, "bytes still carries the submit topology");
+
+        let failed = response(OP_HELLO, 7, -libc::ENODEV, 0, StageTimings::default());
+        assert_eq!(
+            failed.payload_len, 0,
+            "a rejected HELLO has no volume to describe"
+        );
+
+        for opcode in [OP_WRITE, OP_TRIM, OP_CLOSE] {
+            let header = response(opcode, 7, 0, 4096, StageTimings::default());
+            assert_eq!(header.payload_len, 0, "opcode {opcode} must be header-only");
+        }
+        assert_eq!(
+            response(OP_READ, 7, 0, 8192, StageTimings::default()).payload_len,
+            8192,
+            "a read still returns its body"
+        );
+    }
+
+    /// The IO ceiling is validated as `io_len % BLOCK_SIZE == 0` *and*
+    /// `io_len <= MAX_DIRECT_IO_BYTES`, so a ceiling that is not a whole
+    /// number of blocks would make the largest accepted IO smaller than the
+    /// constant advertises in `HelloCapability`.
+    #[test]
+    fn max_direct_io_bytes_is_a_whole_number_of_blocks() {
+        assert_eq!(MAX_DIRECT_IO_BYTES % BLOCK_SIZE as usize, 0);
+        assert!(MAX_DIRECT_IO_BYTES >= BLOCK_SIZE as usize);
+        assert!(
+            u32::try_from(MAX_DIRECT_IO_BYTES).is_ok(),
+            "it is advertised as a u32 and compared against a u32 io_len"
+        );
     }
 
     #[test]

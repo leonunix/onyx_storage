@@ -18,37 +18,67 @@ macro_rules! diagnostic_metrics {
 }
 
 const MAGIC: &[u8; 4] = b"ONIO";
-const VERSION: u16 = 2;
+const VERSION: u16 = 3;
 const REQUEST_LEN: usize = 48;
 const RESPONSE_LEN: usize = 96;
 /// Offset of `RequestHeader::client_submit_ns`, patched into an already-staged
 /// header by `commit()`. See `Client::commit`.
 const REQUEST_SUBMIT_NS_AT: usize = 40;
-/// Largest single response frame: header plus a full read payload.
-const MAX_FRAME: usize = RESPONSE_LEN + BLOCK_SIZE as usize;
-/// Receive buffer, sized so one `read(2)` can deliver many completions.
-///
-/// The reap loop used to cost THREE syscalls per completion — `poll`, then
-/// `read_exact` for the 96-byte header, then `read_exact` for the 4 KiB
-/// payload — and each fio job is a single thread doing that serially for every
-/// response it has outstanding. That showed up in the protocol's own ledger as
-/// `egress_ns` (server `write` -> client finished reading) becoming the largest
-/// segment of the round trip once the server side stopped being the wall.
-/// Reading into a buffer this size amortises the syscalls over up to 64
-/// completions at the cost of one 4 KiB memcpy each, which is ~150 ns against
-/// ~2 us for a syscall.
-const RX_CAPACITY: usize = 64 * MAX_FRAME;
+/// Bytes of capability payload a successful `HELLO` response carries.
+/// Must match the engine's `direct_io::HELLO_CAPABILITY_LEN`.
+const HELLO_CAPABILITY_LEN: usize = 16;
 const BLOCK_SIZE: u32 = 4096;
+/// Largest single IO the engine accepts. Must match the engine's
+/// `direct_io::MAX_DIRECT_IO_BYTES`; the `HELLO` capability payload is checked
+/// against it at connect, so a disagreement is reported rather than assumed
+/// away.
+const MAX_IO_BYTES: u32 = 128 * 1024;
 const MAX_DEPTH: usize = 256;
 const OP_HELLO: u16 = 1;
 const OP_WRITE: u16 = 2;
 const OP_READ: u16 = 3;
 const OP_CLOSE: u16 = 4;
-const DDIR_READ: c_int = 0;
-const DDIR_WRITE: c_int = 1;
+const OP_TRIM: u16 = 5;
+
+// Operation codes as `fio_bridge.c` hands them over. fio's own `enum fio_ddir`
+// numbering is part of its private ABI, so the bridge — the only file that
+// includes `fio.h` — translates into these, and nothing here depends on fio's
+// values.
+const ONYX_OP_READ: c_int = 0;
+const ONYX_OP_WRITE: c_int = 1;
+const ONYX_OP_TRIM: c_int = 2;
+const ONYX_OP_SYNC: c_int = 3;
+
 const FIO_Q_COMPLETED: c_int = 0;
 const FIO_Q_QUEUED: c_int = 1;
 const FIO_Q_BUSY: c_int = 2;
+
+/// Largest single response frame for a job whose biggest IO is `max_bs`:
+/// header plus a full read payload.
+fn max_frame(max_bs: u32) -> usize {
+    RESPONSE_LEN + max_bs as usize
+}
+
+/// Receive buffer size, so one `read(2)` can deliver many completions.
+///
+/// The reap loop used to cost THREE syscalls per completion — `poll`, then
+/// `read_exact` for the 96-byte header, then `read_exact` for the payload —
+/// and each fio job is a single thread doing that serially for every response
+/// it has outstanding. That showed up in the protocol's own ledger as
+/// `egress_ns` (server `write` -> client finished reading) becoming the
+/// largest segment of the round trip once the server side stopped being the
+/// wall. Reading into a buffer this size amortises the syscalls over ~64
+/// small completions at the cost of one memcpy each, which is ~150 ns against
+/// ~2 us for a syscall.
+///
+/// ⚠ The `max(.., 2 * max_frame)` term is a CORRECTNESS floor, not a
+/// performance choice — see `Client::fill`. It is a floor rather than the
+/// whole size because sizing purely off `max_frame` would make a `bs=128k`
+/// job's buffer 8 MiB per job while delivering no more amortisation than
+/// this, and a `bs=4k` job's buffer smaller than the batching it needs.
+fn rx_capacity(max_bs: u32) -> usize {
+    (64 * (RESPONSE_LEN + BLOCK_SIZE as usize)).max(2 * max_frame(max_bs))
+}
 
 #[repr(C)]
 pub struct Timespec {
@@ -342,6 +372,14 @@ struct Client {
     stream: UnixStream,
     next_id: u64,
     depth: usize,
+    /// Largest IO this job may issue — `max(td->o.max_bs[..])`, validated at
+    /// connect against both `MAX_IO_BYTES` and what the engine reported. Every
+    /// buffer below is sized from this rather than from the protocol ceiling,
+    /// so a `bs=4k` job does not pay for a `bs=128k` job's frames.
+    max_bs: u32,
+    /// Volume size as the engine reported it at `HELLO`, surfaced to fio
+    /// through `get_file_size` so a job file does not need `size=`.
+    volume_size: u64,
     slots: [Slot; MAX_DEPTH],
     completed: Vec<*mut c_void>,
     /// Requests staged by `queue` and flushed by `commit` as ONE write.
@@ -357,6 +395,7 @@ struct Client {
     pending: Vec<u8>,
     read_stats: LatencyAccum,
     write_stats: LatencyAccum,
+    trim_stats: LatencyAccum,
     /// How many slots are actually occupied (queued-or-in-flight) each time
     /// `queue()` succeeds — diagnostic for whether fio is genuinely holding
     /// `iodepth` requests outstanding or something is quietly capping it far
@@ -388,6 +427,15 @@ struct Client {
     filled_frames: u64,
 }
 
+/// The geometry the engine reports at `HELLO`. Mirrors the engine's
+/// `direct_io::HelloCapability`.
+#[derive(Clone, Copy)]
+struct HelloCapability {
+    capacity_bytes: u64,
+    block_size: u32,
+    max_io_bytes: u32,
+}
+
 fn request(opcode: u16, payload_len: u32, id: u64, offset: u64, len: u32) -> [u8; REQUEST_LEN] {
     let mut out = [0; REQUEST_LEN];
     out[0..4].copy_from_slice(MAGIC);
@@ -407,8 +455,20 @@ fn u64_at(data: &[u8], at: usize) -> u64 { u64::from_le_bytes(data[at..at + 8].t
 fn errno(error: &io::Error) -> c_int { error.raw_os_error().unwrap_or(libc_errno::EIO) }
 
 impl Client {
-    fn connect(control: &str, volume: &str, depth: usize) -> io::Result<Self> {
+    /// `max_bs` and `ba` come from the job's own options, so a bad block size
+    /// or alignment fails HERE, with a message, instead of turning into an
+    /// `EINVAL` on the first IO that fio reports as a device error.
+    fn connect(control: &str, volume: &str, depth: usize, max_bs: u32, ba: u32)
+               -> io::Result<Self> {
         if depth == 0 || depth > MAX_DEPTH || volume.is_empty() || volume.len() > 255 {
+            return Err(io::Error::from_raw_os_error(libc_errno::EINVAL));
+        }
+        if max_bs == 0 || max_bs % BLOCK_SIZE != 0 || max_bs > MAX_IO_BYTES {
+            return Err(io::Error::from_raw_os_error(libc_errno::EINVAL));
+        }
+        // fio defaults `ba` to `min_bs`, so `--bs=4k-32k` is already aligned;
+        // an explicit `--ba` finer than a block is the case this catches.
+        if ba == 0 || ba % BLOCK_SIZE != 0 {
             return Err(io::Error::from_raw_os_error(libc_errno::EINVAL));
         }
         let mut stream = UnixStream::connect(format!("{control}.io"))?;
@@ -420,13 +480,16 @@ impl Client {
         if u16_at(&response, 6) != OP_HELLO || status != 0 {
             return Err(io::Error::from_raw_os_error(if status < 0 { -status } else { libc_errno::EPROTO }));
         }
+        let capability = Self::read_hello_capability(&mut stream, &response, max_bs)?;
         Ok(Self {
-            stream, next_id: 2, depth,
+            stream, next_id: 2, depth, max_bs,
+            volume_size: capability.capacity_bytes,
             slots: [Slot::default(); MAX_DEPTH],
             completed: Vec::with_capacity(depth),
-            pending: Vec::with_capacity(depth * (REQUEST_LEN + BLOCK_SIZE as usize)),
+            pending: Vec::with_capacity(depth * (REQUEST_LEN + max_bs as usize)),
             read_stats: LatencyAccum::default(),
             write_stats: LatencyAccum::default(),
+            trim_stats: LatencyAccum::default(),
             depth_sum: 0,
             depth_samples: 0,
             depth_max: 0,
@@ -434,7 +497,7 @@ impl Client {
             getevents_calls: 0,
             getevents_wall_ns: 0,
             lifetime_start: Some(metric_now()),
-            rx: vec![0; RX_CAPACITY],
+            rx: vec![0; rx_capacity(max_bs)],
             rx_head: 0,
             rx_tail: 0,
             fills: 0,
@@ -451,21 +514,78 @@ impl Client {
         Ok(response)
     }
 
-    unsafe fn queue(&mut self, io_u: *mut c_void, ddir: c_int, offset: u64,
+    /// Consume the capability payload that follows a successful `HELLO`, and
+    /// check the engine agrees with what this build assumes.
+    ///
+    /// Leaving those bytes on the socket would desynchronise every later
+    /// response, so this runs before the first IO. It is also what softens
+    /// the old "plugin and engine must come from the same tree" rule down to
+    /// "same protocol version": a block size or IO ceiling this build cannot
+    /// honour is now a named error at connect rather than a wrong number.
+    fn read_hello_capability(stream: &mut UnixStream, response: &[u8; RESPONSE_LEN],
+                             max_bs: u32) -> io::Result<HelloCapability> {
+        if u32_at(response, 28) as usize != HELLO_CAPABILITY_LEN {
+            return Err(io::Error::from_raw_os_error(libc_errno::EPROTO));
+        }
+        let mut payload = [0u8; HELLO_CAPABILITY_LEN];
+        stream.read_exact(&mut payload)?;
+        let capability = HelloCapability {
+            capacity_bytes: u64_at(&payload, 0),
+            block_size: u32_at(&payload, 8),
+            max_io_bytes: u32_at(&payload, 12),
+        };
+        if capability.block_size != BLOCK_SIZE || capability.capacity_bytes == 0 {
+            return Err(io::Error::from_raw_os_error(libc_errno::EPROTO));
+        }
+        if max_bs > capability.max_io_bytes {
+            return Err(io::Error::from_raw_os_error(libc_errno::EINVAL));
+        }
+        Ok(capability)
+    }
+
+    unsafe fn queue(&mut self, io_u: *mut c_void, op: c_int, offset: u64,
                     buffer: *mut u8, len: u32) -> Result<c_int, c_int> {
-        let opcode = match ddir {
-            DDIR_READ => OP_READ,
-            DDIR_WRITE => OP_WRITE,
+        // A sync is satisfied without touching the wire, so it is handled
+        // before any slot or framing bookkeeping.
+        //
+        // ⚠ This is correct for Onyx specifically, not a shortcut. The
+        // foreground `append()` blocks until that sequence has completed its
+        // LV2 `fdatasync`, so a write this client has already reaped is
+        // already durable and there is nothing for a flush to push out. The
+        // honest consequence: `--fsync=N` / `--fdatasync=N` measure NOTHING
+        // on this engine, so do not read a number out of them.
+        //
+        // `FIO_Q_COMPLETED` accounts for the io_u right here in fio's queue
+        // path — it must NOT also be pushed onto `completed`, or `event()`
+        // would hand fio the same io_u a second time.
+        if op == ONYX_OP_SYNC {
+            let _ = io_u;
+            return Ok(FIO_Q_COMPLETED);
+        }
+        let opcode = match op {
+            ONYX_OP_READ => OP_READ,
+            ONYX_OP_WRITE => OP_WRITE,
+            ONYX_OP_TRIM => OP_TRIM,
             _ => return Err(libc_errno::EOPNOTSUPP),
         };
-        if len != BLOCK_SIZE || offset % BLOCK_SIZE as u64 != 0 || buffer.is_null() {
+        // The engine takes any block-aligned length; `max_bs` is this job's own
+        // ceiling, already checked against the engine's at connect.
+        if len == 0
+            || len % BLOCK_SIZE != 0
+            || len > self.max_bs
+            || offset % BLOCK_SIZE as u64 != 0
+        {
+            return Err(libc_errno::EINVAL);
+        }
+        // A trim carries no data and fio hands it no payload buffer.
+        if buffer.is_null() && opcode != OP_TRIM {
             return Err(libc_errno::EINVAL);
         }
         let id = self.next_id;
         let index = id as usize % self.depth;
         // FIO_Q_BUSY is fio's "no more room, call ->commit()", which is exactly
         // what a full slot ring means. It also bounds `pending` to
-        // depth * (REQUEST_LEN + BLOCK_SIZE).
+        // depth * (REQUEST_LEN + max_bs).
         if !self.slots[index].io_u.is_null() { return Ok(FIO_Q_BUSY); }
         let header = request(opcode, if opcode == OP_WRITE { len } else { 0 }, id, offset, len);
         let header_at = self.pending.len();
@@ -532,11 +652,20 @@ impl Client {
 
     /// Total length of the response at the head of the buffer, once enough of
     /// it has arrived to know. `None` means "read more first".
+    ///
+    /// A `payload_len` above this job's own `max_bs` cannot be a frame this
+    /// job asked for, and believing it would ask `fill` to wait for bytes the
+    /// buffer has no room for — a hang instead of an error. Reporting the
+    /// frame as complete at its header hands it straight to `collect_framed`,
+    /// which rejects the mismatch as `EPROTO`.
     fn framed_len(&self) -> Option<usize> {
         if self.rx_len() < RESPONSE_LEN {
             return None;
         }
         let payload_len = u32_at(&self.rx[self.rx_head..], 28) as usize;
+        if payload_len > self.max_bs as usize {
+            return Some(RESPONSE_LEN);
+        }
         let total = RESPONSE_LEN + payload_len;
         (self.rx_len() >= total).then_some(total)
     }
@@ -545,15 +674,38 @@ impl Client {
     ///
     /// Compaction keeps at least one whole frame of room at the tail, so a
     /// single read can never be starved into making no progress.
+    ///
+    /// ⚠ That guarantee rests on an invariant worth stating, because breaking
+    /// it does not fail to compile — it produces a phantom `EIO`. Two facts
+    /// combine:
+    ///
+    /// 1. `onyx_rs_getevents` consumes every COMPLETE frame before it ever
+    ///    reaches `fill`, and the stream is ordered, so on entry the unread
+    ///    bytes are a PREFIX of one incomplete frame: `rx_len() < max_frame`.
+    /// 2. `rx_capacity` therefore only needs `2 * max_frame` for compaction to
+    ///    leave `rx.len() - rx_len() > max_frame` free at the tail.
+    ///
+    /// Size `rx` below that and a large frame can compact to zero free room,
+    /// which makes `read(&mut [])` return `Ok(0)` — indistinguishable here
+    /// from a closed socket, so the job dies with an IO error while the
+    /// engine is perfectly healthy.
     fn fill(&mut self) -> Result<bool, c_int> {
+        debug_assert!(
+            self.rx_len() < max_frame(self.max_bs),
+            "fill() must only be reached with a partial frame buffered",
+        );
         if self.rx_head == self.rx_tail {
             self.rx_head = 0;
             self.rx_tail = 0;
-        } else if self.rx.len() - self.rx_tail < MAX_FRAME {
+        } else if self.rx.len() - self.rx_tail < max_frame(self.max_bs) {
             self.rx.copy_within(self.rx_head..self.rx_tail, 0);
             self.rx_tail -= self.rx_head;
             self.rx_head = 0;
         }
+        debug_assert!(
+            self.rx_tail < self.rx.len(),
+            "compaction must always leave room to read into",
+        );
         let read = self
             .stream
             .read(&mut self.rx[self.rx_tail..])
@@ -625,7 +777,8 @@ impl Client {
             let accum = match slot.opcode {
                 OP_READ => &mut self.read_stats,
                 OP_WRITE => &mut self.write_stats,
-                _ => unreachable!("only read/write slots are tracked"),
+                OP_TRIM => &mut self.trim_stats,
+                _ => unreachable!("only read/write/trim slots are tracked"),
             };
             accum.record(sample);
         }
@@ -637,12 +790,13 @@ impl Client {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn onyx_rs_init(socket: *const c_char, volume: *const c_char,
-                                       depth: u32, error: *mut c_int) -> *mut c_void {
+                                       depth: u32, max_bs: u32, ba: u32,
+                                       error: *mut c_int) -> *mut c_void {
     let result = (|| {
         if socket.is_null() || volume.is_null() { return Err(libc_errno::EINVAL); }
         let socket = unsafe { CStr::from_ptr(socket) }.to_str().map_err(|_| libc_errno::EINVAL)?;
         let volume = unsafe { CStr::from_ptr(volume) }.to_str().map_err(|_| libc_errno::EINVAL)?;
-        Client::connect(socket, volume, depth as usize).map_err(|e| errno(&e))
+        Client::connect(socket, volume, depth as usize, max_bs, ba).map_err(|e| errno(&e))
     })();
     match result {
         Ok(client) => Box::into_raw(Box::new(client)).cast(),
@@ -650,11 +804,56 @@ pub unsafe extern "C" fn onyx_rs_init(socket: *const c_char, volume: *const c_ch
     }
 }
 
+/// Largest IO the protocol accepts, so the bridge can name the ceiling in its
+/// own error message instead of leaving the operator with a bare `EINVAL`.
+#[unsafe(no_mangle)]
+pub extern "C" fn onyx_rs_max_io_bytes() -> u32 {
+    MAX_IO_BYTES
+}
+
+/// Volume size as the engine reported it at `HELLO` — fio's `get_file_size`,
+/// which is what makes `size=` optional in a job file.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn onyx_rs_volume_size(client: *mut c_void) -> u64 {
+    if client.is_null() { return 0; }
+    unsafe { &*client.cast::<Client>() }.volume_size
+}
+
+/// Volume size via a throwaway session, for callers that have no client yet.
+///
+/// fio's `create_serialize` defaults to 1, which runs `setup_files` — and
+/// therefore `->get_file_size` — in the parent BEFORE the job thread reaches
+/// `->init`, so `io_ops_data` is still NULL there. Rather than depend on that
+/// ordering (it differs with `create_serialize=0`), this opens a session,
+/// reads the `HELLO` capability, and closes. One connection, no IO; the
+/// server's 64-session limit is never contended because serialized setup
+/// probes one job at a time.
+///
+/// Returns 0 on any failure, which just puts fio back to requiring `size=`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn onyx_rs_probe_volume_size(socket: *const c_char,
+                                                   volume: *const c_char) -> u64 {
+    if socket.is_null() || volume.is_null() { return 0; }
+    let Ok(socket) = unsafe { CStr::from_ptr(socket) }.to_str() else { return 0 };
+    let Ok(volume) = unsafe { CStr::from_ptr(volume) }.to_str() else { return 0 };
+    // Depth 1 and a single-block `max_bs`: this session issues no IO, so the
+    // values only have to pass validation.
+    match Client::connect(socket, volume, 1, BLOCK_SIZE, BLOCK_SIZE) {
+        Ok(mut client) => {
+            let size = client.volume_size;
+            let close = request(OP_CLOSE, 0, client.next_id, 0, 0);
+            let _ = client.stream.write_all(&close);
+            size
+        }
+        Err(_) => 0,
+    }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn onyx_rs_queue(client: *mut c_void, io_u: *mut c_void,
-    ddir: c_int, offset: u64, buffer: *mut c_void, len: u32, error: *mut c_int) -> c_int {
+    op: c_int, offset: u64, buffer: *mut c_void, len: u32, error: *mut c_int) -> c_int {
     let client = unsafe { &mut *client.cast::<Client>() };
-    match unsafe { client.queue(io_u, ddir, offset, buffer.cast(), len) } {
+    match unsafe { client.queue(io_u, op, offset, buffer.cast(), len) } {
         Ok(status) => status,
         Err(code) => { if !error.is_null() { unsafe { *error = code; } } FIO_Q_COMPLETED }
     }
@@ -740,6 +939,7 @@ pub unsafe extern "C" fn onyx_rs_cleanup(client: *mut c_void) {
     let _ = client.stream.write_all(&close);
     client.read_stats.log("read");
     client.write_stats.log("write");
+    client.trim_stats.log("trim");
     if client.depth_samples > 0 {
         eprintln!(
             "onyx-stage depth samples={} avg={:.2} max={}",
@@ -784,16 +984,22 @@ mod libc_errno {
 mod tests {
     use super::*;
 
-    fn test_client(stream: UnixStream, depth: usize) -> Client {
+    /// A client with the buffers `connect` would have sized for a job whose
+    /// largest IO is `max_bs` — including `rx_capacity`, so the framing tests
+    /// exercise the real geometry rather than a generous test-only buffer.
+    fn test_client_bs(stream: UnixStream, depth: usize, max_bs: u32) -> Client {
         Client {
             stream,
             next_id: 2,
             depth,
+            max_bs,
+            volume_size: 1 << 40,
             slots: [Slot::default(); MAX_DEPTH],
             completed: Vec::new(),
             pending: Vec::new(),
             read_stats: LatencyAccum::default(),
             write_stats: LatencyAccum::default(),
+            trim_stats: LatencyAccum::default(),
             depth_sum: 0,
             depth_samples: 0,
             depth_max: 0,
@@ -801,12 +1007,16 @@ mod tests {
             getevents_calls: 0,
             getevents_wall_ns: 0,
             lifetime_start: None,
-            rx: vec![0; RX_CAPACITY],
+            rx: vec![0; rx_capacity(max_bs)],
             rx_head: 0,
             rx_tail: 0,
             fills: 0,
             filled_frames: 0,
         }
+    }
+
+    fn test_client(stream: UnixStream, depth: usize) -> Client {
+        test_client_bs(stream, depth, BLOCK_SIZE)
     }
 
     /// Minimal well-formed response frame, matching the server's encoding.
@@ -852,7 +1062,7 @@ mod tests {
         let io_u = 0x1000usize as *mut c_void;
 
         let status = unsafe {
-            client.queue(io_u, DDIR_WRITE, 8192, payload.as_mut_ptr(), BLOCK_SIZE)
+            client.queue(io_u, ONYX_OP_WRITE, 8192, payload.as_mut_ptr(), BLOCK_SIZE)
         };
         assert_eq!(status, Ok(FIO_Q_QUEUED));
         assert_eq!(
@@ -886,14 +1096,14 @@ mod tests {
         for i in 0..3 {
             let st = unsafe {
                 client.queue(
-                    (0x2000 + i) as *mut c_void, DDIR_WRITE,
+                    (0x2000 + i) as *mut c_void, ONYX_OP_WRITE,
                     (i as u64 + 2) * 4096, payload.as_mut_ptr(), BLOCK_SIZE,
                 )
             };
             assert_eq!(st, Ok(FIO_Q_QUEUED));
         }
         let busy = unsafe {
-            client.queue(io_u, DDIR_WRITE, 4096 * 99, payload.as_mut_ptr(), BLOCK_SIZE)
+            client.queue(io_u, ONYX_OP_WRITE, 4096 * 99, payload.as_mut_ptr(), BLOCK_SIZE)
         };
         assert_eq!(busy, Ok(FIO_Q_BUSY), "ring full => BUSY, bounding `pending`");
     }
@@ -978,6 +1188,298 @@ mod tests {
         assert_eq!(total, RESPONSE_LEN);
         client.collect_framed(total).unwrap();
         assert_eq!(client.completed.len(), 1);
+    }
+
+    /// Multi-block IO is the whole point of protocol 3: the engine's aligned
+    /// fast path already takes any `lba_count`, so the plugin must stop
+    /// insisting on exactly one block.
+    #[test]
+    fn queue_accepts_a_multi_block_io_and_stages_the_whole_payload() {
+        let (a, _b) = UnixStream::pair().unwrap();
+        let mut client = test_client_bs(a, 4, 32 * 1024);
+        let len = 32 * 1024u32;
+        let mut payload = vec![0xC3u8; len as usize];
+        payload[len as usize - 1] = 0x7E;
+
+        let status = unsafe {
+            client.queue(0x1000usize as *mut c_void, ONYX_OP_WRITE, 8192,
+                         payload.as_mut_ptr(), len)
+        };
+        assert_eq!(status, Ok(FIO_Q_QUEUED));
+        assert_eq!(client.pending.len(), REQUEST_LEN + len as usize);
+        assert_eq!(u32_at(&client.pending, 12), len, "payload_len is the full IO");
+        assert_eq!(u32_at(&client.pending, 32), len, "io_len is the full IO");
+        assert_eq!(
+            *client.pending.last().unwrap(), 0x7E,
+            "the LAST payload byte must be staged, not just the first block",
+        );
+    }
+
+    /// Both directions of the size gate. `max_bs` is the job's own ceiling,
+    /// so a job configured for 32k must refuse 33k even though the protocol
+    /// would accept it — the receive buffer was sized for 32k.
+    #[test]
+    fn queue_rejects_lengths_outside_the_jobs_block_size() {
+        let (a, _b) = UnixStream::pair().unwrap();
+        let mut client = test_client_bs(a, 4, 32 * 1024);
+        let mut payload = vec![0u8; 64 * 1024];
+        let io_u = 0x1000usize as *mut c_void;
+
+        for bad in [0u32, 6 * 1024, BLOCK_SIZE + 1, 33 * 1024, 64 * 1024] {
+            let status = unsafe {
+                client.queue(io_u, ONYX_OP_WRITE, 0, payload.as_mut_ptr(), bad)
+            };
+            assert_eq!(status, Err(libc_errno::EINVAL), "len {bad} must be refused");
+        }
+        for good in [BLOCK_SIZE, 2 * BLOCK_SIZE, 32 * 1024] {
+            let status = unsafe {
+                client.queue(io_u, ONYX_OP_WRITE, 0, payload.as_mut_ptr(), good)
+            };
+            assert_eq!(status, Ok(FIO_Q_QUEUED), "len {good} must be accepted");
+            client.pending.clear();
+            client.staged.clear();
+            client.slots = [Slot::default(); MAX_DEPTH];
+        }
+        // An unaligned offset stays refused whatever the length.
+        let status = unsafe {
+            client.queue(io_u, ONYX_OP_WRITE, 512, payload.as_mut_ptr(), BLOCK_SIZE)
+        };
+        assert_eq!(status, Err(libc_errno::EINVAL));
+    }
+
+    /// ⚠ THE regression this protocol change could introduce silently.
+    ///
+    /// `fill` compacts only when the tail has less than one whole frame free.
+    /// If `rx` were sized off anything smaller than `2 * max_frame`, a large
+    /// read frame could compact to ZERO free room, `read(&mut [])` would
+    /// return `Ok(0)`, and `getevents` would report `EIO` on a perfectly
+    /// healthy engine. This drives a 32 KiB read through the split-read path
+    /// at a non-zero `rx_head` — the state that triggers compaction.
+    #[test]
+    fn a_large_read_frame_split_across_two_reads_still_completes() {
+        let len = 32 * 1024u32;
+        let (a, mut b) = UnixStream::pair().unwrap();
+        let mut client = test_client_bs(a, 8, len);
+        assert!(
+            client.rx.len() >= 2 * max_frame(len),
+            "the correctness floor itself: rx {} vs 2*max_frame {}",
+            client.rx.len(),
+            2 * max_frame(len),
+        );
+
+        // Consume a small frame first so `rx_head` is non-zero and the next
+        // fill has to compact rather than start clean.
+        let mut warmup_target = vec![0u8; BLOCK_SIZE as usize];
+        client.slots[2] = Slot {
+            id: 2, io_u: 0x2000usize as *mut c_void,
+            buffer: warmup_target.as_mut_ptr(), len: BLOCK_SIZE,
+            opcode: OP_READ, queued_at: Some(Instant::now()), stage_delay_ns: 0,
+        };
+        let mut warmup = response_frame(OP_READ, 2, BLOCK_SIZE, BLOCK_SIZE);
+        warmup[RESPONSE_LEN..].fill(0x11);
+        b.write_all(&warmup).unwrap();
+        client.fill().unwrap();
+        let total = client.framed_len().unwrap();
+        client.collect_framed(total).unwrap();
+        assert!(client.rx_head > 0, "the next fill must have to compact");
+
+        let id = 3u64;
+        let mut target = vec![0u8; len as usize];
+        client.slots[id as usize % client.depth] = Slot {
+            id, io_u: 0x3000usize as *mut c_void,
+            buffer: target.as_mut_ptr(), len,
+            opcode: OP_READ, queued_at: Some(Instant::now()), stage_delay_ns: 0,
+        };
+        let mut frame = response_frame(OP_READ, id, len, len);
+        frame[RESPONSE_LEN..].fill(0xA5);
+        let split = RESPONSE_LEN + 1024;
+
+        b.write_all(&frame[..split]).unwrap();
+        assert!(client.fill().unwrap(), "first half must not look like EOF");
+        assert_eq!(client.framed_len(), None, "a partial body is not a frame");
+
+        b.write_all(&frame[split..]).unwrap();
+        while client.framed_len().is_none() {
+            assert!(client.fill().unwrap(), "the rest must arrive, not EOF");
+        }
+        let total = client.framed_len().unwrap();
+        assert_eq!(total, RESPONSE_LEN + len as usize);
+        client.collect_framed(total).unwrap();
+        assert!(
+            target.iter().all(|byte| *byte == 0xA5),
+            "the whole 32 KiB body must land in fio's buffer",
+        );
+    }
+
+    /// A `payload_len` this job could never have asked for must become an
+    /// error, not a wait for bytes the buffer has no room to hold.
+    #[test]
+    fn an_oversized_payload_len_is_rejected_rather_than_waited_on() {
+        let (a, mut b) = UnixStream::pair().unwrap();
+        let mut client = test_client_bs(a, 8, BLOCK_SIZE);
+        let id = 2u64;
+        client.slots[id as usize % client.depth] = Slot {
+            id, io_u: 0x2000usize as *mut c_void,
+            buffer: ptr::null_mut(), len: BLOCK_SIZE,
+            opcode: OP_READ, queued_at: Some(Instant::now()), stage_delay_ns: 0,
+        };
+        // A 96-byte header claiming a body far larger than `max_bs`. Built by
+        // patching the length field rather than by asking `response_frame` for
+        // the body, because a real 1 MiB write would just block the socketpair.
+        let mut header = response_frame(OP_READ, id, BLOCK_SIZE, 0);
+        header[28..32].copy_from_slice(&(1u32 << 20).to_le_bytes());
+        b.write_all(&header).unwrap();
+        client.fill().unwrap();
+
+        assert_eq!(
+            client.framed_len(),
+            Some(RESPONSE_LEN),
+            "an impossible payload_len must be handed on, not waited for",
+        );
+        assert_eq!(client.collect_framed(RESPONSE_LEN), Err(libc_errno::EPROTO));
+    }
+
+    /// Different sizes in one batch must keep their own header/payload
+    /// boundaries — the staging buffer is one contiguous write.
+    #[test]
+    fn mixed_sizes_in_one_commit_keep_their_boundaries() {
+        let (a, mut b) = UnixStream::pair().unwrap();
+        let mut client = test_client_bs(a, 8, 32 * 1024);
+        let sizes = [BLOCK_SIZE, 32 * 1024, 2 * BLOCK_SIZE];
+        let mut payloads: Vec<Vec<u8>> = sizes
+            .iter()
+            .enumerate()
+            .map(|(i, len)| vec![0xD0 + i as u8; *len as usize])
+            .collect();
+
+        for (i, len) in sizes.iter().enumerate() {
+            let status = unsafe {
+                client.queue((0x1000 + i) as *mut c_void, ONYX_OP_WRITE,
+                             i as u64 * 64 * 1024, payloads[i].as_mut_ptr(), *len)
+            };
+            assert_eq!(status, Ok(FIO_Q_QUEUED));
+        }
+        client.commit().unwrap();
+
+        let expected: usize = sizes.iter().map(|len| REQUEST_LEN + *len as usize).sum();
+        let mut got = vec![0u8; expected];
+        b.read_exact(&mut got).unwrap();
+        let mut at = 0;
+        for (i, len) in sizes.iter().enumerate() {
+            assert_eq!(u16_at(&got, at + 6), OP_WRITE, "request {i} header");
+            assert_eq!(u32_at(&got, at + 32), *len, "request {i} io_len");
+            assert_eq!(u64_at(&got, at + 24), i as u64 * 64 * 1024, "request {i} offset");
+            assert_eq!(
+                got[at + REQUEST_LEN], 0xD0 + i as u8,
+                "request {i}'s payload must start right after ITS header",
+            );
+            at += REQUEST_LEN + *len as usize;
+        }
+    }
+
+    /// A sync must not reach the wire, and must not be double-reported.
+    ///
+    /// Onyx acks a write only after its LV2 `fdatasync`, so there is nothing
+    /// for a flush to push out. `FIO_Q_COMPLETED` accounts for the io_u in
+    /// fio's queue path, so pushing it onto `completed` as well would hand
+    /// fio the same io_u a second time through `event()`.
+    #[test]
+    fn sync_completes_locally_without_touching_the_wire_or_completed() {
+        let (a, _b) = UnixStream::pair().unwrap();
+        let mut client = test_client(a, 4);
+        let status = unsafe {
+            client.queue(0x9000usize as *mut c_void, ONYX_OP_SYNC, 0, ptr::null_mut(), 0)
+        };
+        assert_eq!(status, Ok(FIO_Q_COMPLETED));
+        assert!(client.pending.is_empty(), "a sync must stage no bytes");
+        assert!(client.staged.is_empty());
+        assert!(
+            client.completed.is_empty(),
+            "FIO_Q_COMPLETED already accounted for it; event() must not see it again",
+        );
+        assert!(client.slots.iter().all(|s| s.io_u.is_null()), "no slot consumed");
+    }
+
+    /// A trim carries no payload but does carry a length, and fio hands it no
+    /// buffer — so the null-buffer check must not reject it.
+    #[test]
+    fn trim_stages_a_header_only_request() {
+        let (a, _b) = UnixStream::pair().unwrap();
+        let mut client = test_client_bs(a, 4, 32 * 1024);
+        let len = 8 * BLOCK_SIZE;
+        let status = unsafe {
+            client.queue(0x4000usize as *mut c_void, ONYX_OP_TRIM, 4096,
+                         ptr::null_mut(), len)
+        };
+        assert_eq!(status, Ok(FIO_Q_QUEUED));
+        assert_eq!(client.pending.len(), REQUEST_LEN, "no payload follows a trim");
+        assert_eq!(u16_at(&client.pending, 6), OP_TRIM);
+        assert_eq!(u32_at(&client.pending, 12), 0, "payload_len must be 0");
+        assert_eq!(u32_at(&client.pending, 32), len, "io_len is the trim range");
+    }
+
+    /// A read or write with no buffer is still a bug, even now that trim is
+    /// allowed to pass a null one.
+    #[test]
+    fn a_data_op_without_a_buffer_is_still_refused() {
+        let (a, _b) = UnixStream::pair().unwrap();
+        let mut client = test_client(a, 4);
+        for op in [ONYX_OP_READ, ONYX_OP_WRITE] {
+            let status = unsafe {
+                client.queue(0x5000usize as *mut c_void, op, 0, ptr::null_mut(), BLOCK_SIZE)
+            };
+            assert_eq!(status, Err(libc_errno::EINVAL));
+        }
+    }
+
+    /// An op code the bridge should never emit must be refused, not mapped to
+    /// whatever opcode happens to sit at that index.
+    #[test]
+    fn an_unknown_op_is_refused() {
+        let (a, _b) = UnixStream::pair().unwrap();
+        let mut client = test_client(a, 4);
+        let mut payload = [0u8; BLOCK_SIZE as usize];
+        for op in [-1, 4, 99] {
+            let status = unsafe {
+                client.queue(0x6000usize as *mut c_void, op, 0,
+                             payload.as_mut_ptr(), BLOCK_SIZE)
+            };
+            assert_eq!(status, Err(libc_errno::EOPNOTSUPP), "op {op}");
+        }
+    }
+
+    /// `rx_capacity` has to satisfy BOTH jobs: batch small completions, and
+    /// never fall below the compaction floor for large ones.
+    #[test]
+    fn rx_capacity_holds_the_compaction_floor_at_every_block_size() {
+        for max_bs in [BLOCK_SIZE, 8 * 1024, 32 * 1024, 64 * 1024, MAX_IO_BYTES] {
+            let capacity = rx_capacity(max_bs);
+            assert!(
+                capacity >= 2 * max_frame(max_bs),
+                "max_bs {max_bs}: {capacity} is below the {} floor",
+                2 * max_frame(max_bs),
+            );
+            assert!(
+                capacity >= 64 * (RESPONSE_LEN + BLOCK_SIZE as usize),
+                "max_bs {max_bs}: {capacity} gives up small-completion batching",
+            );
+        }
+        assert_eq!(
+            rx_capacity(BLOCK_SIZE),
+            64 * (RESPONSE_LEN + BLOCK_SIZE as usize),
+            "a 4k job must not pay for a large job's frames",
+        );
+    }
+
+    /// The plugin's copies of the engine's protocol constants. A silent drift
+    /// here is exactly what the `HELLO` capability check exists to catch at
+    /// runtime, but catching it at build time is cheaper.
+    #[test]
+    fn protocol_constants_are_self_consistent() {
+        assert_eq!(MAX_IO_BYTES % BLOCK_SIZE, 0);
+        assert!(MAX_IO_BYTES >= BLOCK_SIZE);
+        assert_eq!(HELLO_CAPABILITY_LEN, 16);
+        assert_eq!(VERSION, 3, "the capability payload arrived with version 3");
     }
 
     /// The stamp is only comparable against the server's because both read the

@@ -16,8 +16,9 @@ use crossbeam_channel::{Receiver, Sender};
 
 use onyx_storage::config::OnyxConfig;
 use onyx_storage::direct_io::{
-    monotonic_ns, RequestHeader, ResponseHeader, MAX_DIRECT_IO_OUTSTANDING, MAX_VOLUME_NAME_BYTES,
-    OP_CLOSE, OP_HELLO, OP_WRITE, REQUEST_HEADER_LEN, RESPONSE_HEADER_LEN,
+    monotonic_ns, HelloCapability, RequestHeader, ResponseHeader, HELLO_CAPABILITY_LEN,
+    MAX_DIRECT_IO_BYTES, MAX_DIRECT_IO_OUTSTANDING, MAX_VOLUME_NAME_BYTES, OP_CLOSE, OP_HELLO,
+    OP_WRITE, REQUEST_HEADER_LEN, RESPONSE_HEADER_LEN,
 };
 use onyx_storage::engine::OnyxEngine;
 use onyx_storage::metrics::{EngineMetricsSnapshot, EngineStatusSnapshot, MetaMemorySnapshot};
@@ -392,6 +393,14 @@ struct DirectApiClient {
     stream: UnixStream,
     next_request_id: u64,
     server_workers_per_lane: u32,
+    /// Geometry the engine reported at HELLO — protocol 3 makes the session
+    /// self-describing, so this harness no longer has to assume it.
+    capability: HelloCapability,
+    /// `request_id -> io_len` for writes in flight, so a completion can be
+    /// checked against what was actually asked for.  Protocol 2 allowed only
+    /// one IO size, so comparing against `BLOCK_SIZE` was equivalent; now it
+    /// would only be checking this harness's own choice of `bs`.
+    inflight_bytes: HashMap<u64, u32>,
 }
 
 impl DirectApiClient {
@@ -408,6 +417,12 @@ impl DirectApiClient {
             stream,
             next_request_id: 1,
             server_workers_per_lane: 0,
+            capability: HelloCapability {
+                capacity_bytes: 0,
+                block_size: 0,
+                max_io_bytes: 0,
+            },
+            inflight_bytes: HashMap::new(),
         };
         client.write_request(
             RequestHeader {
@@ -423,7 +438,7 @@ impl DirectApiClient {
         )?;
         let response = client.read_response()?;
         client.validate_response(&response, OP_HELLO, 0)?;
-        client.reject_response_payload(&response)?;
+        client.capability = client.read_hello_capability(&response)?;
         if response.bytes == 0 {
             return Err(anyhow!("direct API HELLO reported zero submit workers"));
         }
@@ -431,20 +446,57 @@ impl DirectApiClient {
         Ok(client)
     }
 
+    /// Consume the capability payload protocol 3 appends to a successful
+    /// HELLO, and check it describes the geometry this build compiled
+    /// against.  Leaving the payload on the socket would desynchronise every
+    /// later response, so this must run before the first IO.
+    fn read_hello_capability(&mut self, response: &ResponseHeader) -> Result<HelloCapability> {
+        if response.payload_len as usize != HELLO_CAPABILITY_LEN {
+            return Err(anyhow!(
+                "direct API HELLO carried a {}-byte payload, expected {HELLO_CAPABILITY_LEN}",
+                response.payload_len
+            ));
+        }
+        let mut payload = vec![0u8; HELLO_CAPABILITY_LEN];
+        self.stream.read_exact(&mut payload)?;
+        let capability = HelloCapability::decode(&payload)?;
+        if capability.block_size != BLOCK_SIZE {
+            return Err(anyhow!(
+                "engine reports a {}-byte block size, this build assumes {BLOCK_SIZE}",
+                capability.block_size
+            ));
+        }
+        if capability.capacity_bytes == 0 {
+            return Err(anyhow!("direct API HELLO reported a zero-byte volume"));
+        }
+        Ok(capability)
+    }
+
     fn submit_write(&mut self, offset: u64, payload: &[u8]) -> Result<u64> {
+        let io_len = u32::try_from(payload.len())
+            .ok()
+            .filter(|len| *len != 0 && *len <= self.capability.max_io_bytes)
+            .ok_or_else(|| {
+                anyhow!(
+                    "write of {} bytes exceeds the engine's {}-byte IO limit",
+                    payload.len(),
+                    self.capability.max_io_bytes
+                )
+            })?;
         let request_id = self.take_request_id()?;
         self.write_request(
             RequestHeader {
                 opcode: OP_WRITE,
                 flags: 0,
-                payload_len: payload.len() as u32,
+                payload_len: io_len,
                 request_id,
                 offset,
-                io_len: payload.len() as u32,
+                io_len,
                 client_submit_ns: 0,
             },
             payload,
         )?;
+        self.inflight_bytes.insert(request_id, io_len);
         Ok(request_id)
     }
 
@@ -452,9 +504,18 @@ impl DirectApiClient {
         let response = self.read_response()?;
         self.validate_response(&response, OP_WRITE, response.request_id)?;
         self.reject_response_payload(&response)?;
-        if response.bytes != BLOCK_SIZE as u32 {
+        let expected = self
+            .inflight_bytes
+            .remove(&response.request_id)
+            .ok_or_else(|| {
+                anyhow!(
+                    "write completion {} has no matching in-flight request",
+                    response.request_id
+                )
+            })?;
+        if response.bytes != expected {
             return Err(anyhow!(
-                "write completion {} reports {} bytes, expected {BLOCK_SIZE}",
+                "write completion {} reports {} bytes, expected {expected}",
                 response.request_id,
                 response.bytes
             ));
@@ -821,8 +882,15 @@ fn validate_remote_args(cli: &Cli) -> Result<()> {
         ));
     }
     if cli.min_bs != BLOCK_SIZE as u64 || cli.max_bs != BLOCK_SIZE as u64 {
+        // The protocol itself accepts any block-aligned IO up to
+        // MAX_DIRECT_IO_BYTES; what is still fixed at 4 KiB is this harness's
+        // own per-QD-slot buffer pool (`issue_remote_write`'s `free_buffers`).
+        // For a variable-size load generator over the same socket, use the
+        // fio external ioengine in `fio/` instead.
         return Err(anyhow!(
-            "remote mode currently supports 4K IO only; use --min-bs 4k --max-bs 4k"
+            "remote mode's buffer pool is fixed at {BLOCK_SIZE}-byte IO (the protocol allows \
+             up to {MAX_DIRECT_IO_BYTES}); use --min-bs 4k --max-bs 4k, or the fio plugin \
+             in fio/ for a bs range"
         ));
     }
     if cli.pattern != Pattern::FioDefault {
