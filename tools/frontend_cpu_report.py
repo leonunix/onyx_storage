@@ -88,8 +88,16 @@ def arms_in(run_dir):
     """
     found = []
     for name in os.listdir(run_dir):
-        if name.startswith("cpu.") and name.endswith(".start"):
-            arm = name[len("cpu."):-len(".start")]
+        if not (name.startswith("cpu.") and name.endswith(".start")):
+            continue
+        arm = name[len("cpu."):-len(".start")]
+        # Skip arms still mid-window. Peeking at a RUNNING A/B is the normal
+        # way to use this, so an in-flight arm must be absent from the report
+        # rather than a traceback over it.
+        for edge in ("cpu.%s.end", "status.%s.start", "status.%s.end"):
+            if not os.path.exists(os.path.join(run_dir, edge % arm)):
+                break
+        else:
             started = parse_kv(os.path.join(run_dir, name)).get("wall_ns", 0)
             found.append((started, arm))
     return [arm for _, arm in sorted(found)]

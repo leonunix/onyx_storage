@@ -596,6 +596,20 @@ enabled = false
 [service]
 socket_path = "/tmp/onyx-storage-nvme.sock"
 
+# Direct-IO (fio plugin / engine_bench) submit workers — the pool that does the
+# ACTUAL engine work on that path, i.e. the counterpart of `ublk.io_workers`.
+#
+# ⛔ PINNED because 0 sizes it from an UNRELATED knob: `ublk.nr_queues *
+# ublk.queue_workers`. That was 32*4 = 128 when the plugin last measured at
+# parity with ublk; tuning `nr_queues` 32 -> 8 -> 4 for ublk's completion drain
+# depth (`8d7f861`) silently took it to 4*4 = **16**, half of `io_workers`' 32
+# and half the measured QD256 floor. The plugin then measured 24.3% slower than
+# ublk at 4k-32k and saturated at 4 jobs (856 MiB/s) without gaining anything
+# from 16 (812) — the signature of a fixed-width pool, not of per-IO cost.
+# Matched to `io_workers` so the two frontends get equal engine-side
+# concurrency, which is the premise every U-vs-P comparison depends on.
+direct_io_workers = 32
+
 [ha]
 enabled = false
 node_id = 0
