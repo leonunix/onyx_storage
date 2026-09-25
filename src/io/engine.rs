@@ -1204,7 +1204,13 @@ impl IoEngine {
         let mut buf = AlignedBuf::new(total_size, self.use_hugepages)?;
         let slice = buf.as_mut_slice();
         slice[..payload.len()].copy_from_slice(payload);
-        // Padding is already zero
+        // ⚠ The O_DIRECT round-up tail must be covered explicitly. This used to
+        // say "padding is already zero", which was only true on the
+        // `alloc_zeroed` miss path — a pooled buffer comes back with the
+        // previous user's bytes in it, and all `total_size` bytes go to the
+        // device. Same tail-only fill as `submit_write_batch`, so nothing pays
+        // a memset over the part the payload already covers.
+        slice[payload.len()..].fill(0);
 
         match &self.backend {
             IoBackend::Syscall => {
@@ -1648,7 +1654,11 @@ impl IoEngine {
                     let total = ((payload.len() + bs - 1) / bs) * bs;
                     let offset = self.pba_to_offset(*pba);
                     let mut buf = AlignedBuf::new(total, self.use_hugepages)?;
-                    buf.as_mut_slice()[..payload.len()].copy_from_slice(payload);
+                    let slice = buf.as_mut_slice();
+                    slice[..payload.len()].copy_from_slice(payload);
+                    // Cover the O_DIRECT tail: `total` bytes are submitted and a
+                    // recycled buffer's tail is the previous op's data.
+                    slice[payload.len()..total].fill(0);
                     let ptr = buf.as_ptr();
                     owned_bufs.push(buf);
                     uring_ops.push(UringOp::Write {
@@ -1801,7 +1811,12 @@ impl IoEngine {
                     continue;
                 }
                 let total = ((payload.len() + bs - 1) / bs) * bs;
-                slab.as_mut_slice()[cursor..cursor + payload.len()].copy_from_slice(payload);
+                let dst = &mut slab.as_mut_slice()[cursor..cursor + total];
+                dst[..payload.len()].copy_from_slice(payload);
+                // Cover this op's O_DIRECT tail — `total` bytes are submitted
+                // from a slab that may be a recycled buffer or an arena slot,
+                // both of which come back dirty.
+                dst[payload.len()..].fill(0);
                 uring_ops.push(UringOp::Write {
                     fd,
                     ptr: unsafe { slab.as_ptr().add(cursor) },

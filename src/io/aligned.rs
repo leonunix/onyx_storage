@@ -20,6 +20,16 @@ thread_local! {
     /// CPU in `smp_call_function_many_cond` → `flush_tlb_mm_range`
     /// from the `persistent-slot` (LV2 sync) thread. Pooling the
     /// allocation keeps the pages resident and skips the madvise.
+    ///
+    /// ⛔ **This pool does NOT solve that problem, measured.** A 2026-09-24
+    /// in-engine `perf` profile caught `persistent-slot` still issuing ~12.9k
+    /// madvise/s — 62 % of the box's 20.7k/s — because the hit condition is
+    /// `parked.layout.size() >= size` and an LV2 span's length is a wide random
+    /// variable under a 4k-32k workload, so misses come from SIZE mismatch at
+    /// any rate. The real fix is [`crate::mem::SlabArena`], whose module doc
+    /// explains why a *bigger* parking lot is worse (take is a full scan).
+    /// This pool is kept only for the many cold callers that do not have an
+    /// arena. See memory `perf_inside_engine_first_cpu_ledger`.
     static ALIGNED_BUF_POOL: RefCell<Vec<AlignedBuf>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -63,6 +73,15 @@ impl AlignedBuf {
     /// Allocate an aligned buffer of the given size.
     /// Size will be rounded up to a multiple of BLOCK_SIZE.
     ///
+    /// ⚠ **The contents are UNDEFINED.** The caller must write every byte it
+    /// then submits to a device. This has always been the actual behaviour —
+    /// the per-thread pool below hands a parked buffer back without zeroing it,
+    /// and an arena slot comes back dirty by design
+    /// ([`crate::mem::SlabArena`] invariant 3) — but it used to be documented
+    /// as "already zeroed" because the *miss* path happens to call
+    /// `alloc_zeroed`. Sites that genuinely need zeros must say so:
+    /// [`AlignedBuf::new_zeroed`].
+    ///
     /// Hot-path callers (LV2 sync, LV3 writer) hit a per-thread
     /// allocation pool first: a parked buf whose capacity already
     /// fits is reused in place, skipping jemalloc and the
@@ -85,6 +104,25 @@ impl AlignedBuf {
         }
 
         Self::alloc_regular(aligned_size)
+    }
+
+    /// Allocate an aligned buffer whose `[0..len)` is guaranteed to be zero.
+    ///
+    /// For the sites that write only part of a block and then submit the whole
+    /// block — a superblock's reserved tail, a checkpoint page past its
+    /// payload, a compact header's padding. [`AlignedBuf::new`] cannot serve
+    /// them: it may hand back a recycled buffer, in which case the tail is
+    /// whatever the previous user left there and that is what reaches the disk.
+    ///
+    /// Not a hot path by construction — anything hot enough to care should be
+    /// covering every byte it submits instead.
+    pub fn new_zeroed(size: usize, use_hugepages: bool) -> OnyxResult<Self> {
+        let mut buf = Self::new(size, use_hugepages)?;
+        // `alloc_zeroed`/fresh `mmap` already gives zeros, but a pooled or
+        // arena-backed buffer does not, and the caller asked for the guarantee
+        // rather than for whichever path it happened to take.
+        buf.as_mut_slice().fill(0);
+        Ok(buf)
     }
 
     /// Try to reuse a parked buffer whose capacity is >= `size`.

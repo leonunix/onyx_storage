@@ -411,9 +411,12 @@ pub fn format_device(device: &dyn BlockBackend) -> OnyxResult<DataSuperblock> {
 
     // Zero blocks 1 through RESERVED_BLOCKS-1
     let zero_bytes = ((RESERVED_BLOCKS - 1) * BLOCK_SIZE as u64) as usize;
-    let mut zeros = AlignedBuf::new(zero_bytes, false)?;
-    // AlignedBuf is already zeroed
-    let _ = zeros.as_mut_slice(); // ensure mutable access
+    // `new_zeroed`, not `new`: the whole buffer goes to the device and nothing
+    // here writes a single byte of it. `AlignedBuf::new` makes no content
+    // guarantee — its thread-local pool hands back the previous user's bytes —
+    // so the old "AlignedBuf is already zeroed" comment was relying on this
+    // path happening to run on a thread with an empty pool.
+    let zeros = AlignedBuf::new_zeroed(zero_bytes, false)?;
     device.write_at(zeros.as_slice(), BLOCK_SIZE as u64)?;
     device.flush()?;
 

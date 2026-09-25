@@ -733,3 +733,91 @@ fn allocator_phase_composes_to_aligned_device_offset() {
         assert_eq!(dev_off % stripe_bytes, 0, "pba {} unaligned", e.start.0);
     }
 }
+
+/// Poison the calling thread's `AlignedBuf` parking lot with buffers of
+/// `size`, then drop them so the next `AlignedBuf::new(size)` on this thread
+/// hands one back — dirty.
+///
+/// ⚠ This is the whole point of the tests below: `AlignedBuf::new` makes NO
+/// content guarantee (its pool returns the previous user's bytes, and an arena
+/// slot comes back dirty by design), so any write path that submits more bytes
+/// than it fills is leaking heap contents to the device. Three such paths
+/// existed and each said "padding is already zero" in a comment.
+fn poison_thread_buffer_pool(size: usize, poison: u8) {
+    let mut parked = Vec::new();
+    for _ in 0..4 {
+        let mut buf = AlignedBuf::new(size, false).unwrap();
+        buf.as_mut_slice().fill(poison);
+        parked.push(buf);
+    }
+    drop(parked);
+}
+
+#[test]
+fn write_blocks_zeroes_the_odirect_tail_from_a_dirty_buffer() {
+    let dir = TempDir::new().unwrap();
+    let dev = fresh_device(&dir, "lv3", 1024 * 1024);
+    let engine = IoEngine::new_raw(dev, false);
+
+    // 3000 bytes of payload in a 4096-byte block: 1096 bytes of tail that the
+    // caller never writes but the device still receives.
+    poison_thread_buffer_pool(4096, 0xAA);
+    let payload = vec![0x11u8; 3000];
+    engine.write_block(Pba(0), &payload).unwrap();
+
+    let read = engine.read_block(Pba(0), 4096).unwrap();
+    assert_eq!(&read[..3000], &payload[..]);
+    assert!(
+        read[3000..].iter().all(|b| *b == 0),
+        "O_DIRECT tail must be zero, not the previous buffer user's bytes"
+    );
+}
+
+#[test]
+fn uring_batch_zeroes_the_odirect_tail_from_a_dirty_buffer() {
+    let dir = TempDir::new().unwrap();
+    let dev = fresh_device(&dir, "lv3", 1024 * 1024);
+    let session = Arc::new(IoUringSession::new(16).unwrap());
+    let engine = IoEngine::with_options(Arc::new(dev), false, 0, None, IoBackend::Uring(session));
+
+    // The batch path packs every op into one slab, so poison that width too.
+    poison_thread_buffer_pool(4096, 0xBB);
+    poison_thread_buffer_pool(8192, 0xBB);
+    let first = vec![0x22u8; 3000];
+    let second = vec![0x33u8; 1000];
+    let ops = vec![
+        LvOp::Write {
+            pba: Pba(0),
+            payload: &first,
+        },
+        LvOp::Write {
+            pba: Pba(1),
+            payload: &second,
+        },
+    ];
+    engine.submit_batch(ops, false).unwrap();
+
+    let a = engine.read_block(Pba(0), 4096).unwrap();
+    assert_eq!(&a[..3000], &first[..]);
+    assert!(
+        a[3000..].iter().all(|b| *b == 0),
+        "first op's tail must be zero"
+    );
+    let b = engine.read_block(Pba(1), 4096).unwrap();
+    assert_eq!(&b[..1000], &second[..]);
+    assert!(
+        b[1000..].iter().all(|b| *b == 0),
+        "second op's tail must be zero"
+    );
+}
+
+#[test]
+fn new_zeroed_gives_zeros_even_from_the_pool() {
+    poison_thread_buffer_pool(4096, 0xCC);
+    let buf = AlignedBuf::new_zeroed(4096, false).unwrap();
+    assert!(
+        buf.as_slice().iter().all(|b| *b == 0),
+        "new_zeroed must zero a recycled buffer, which is the guarantee \
+         `AlignedBuf::new` does NOT make"
+    );
+}
