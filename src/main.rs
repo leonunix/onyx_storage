@@ -156,6 +156,17 @@ enum Command {
         /// `on` / `off`; omit to just read the current state.
         state: Option<String>,
     },
+    /// Read or flip metadb's persistent checkpoint worker pool.
+    ///
+    /// `off` puts both checkpoint fan-outs back on `std::thread::scope`, which
+    /// creates and destroys 16 threads per cycle and makes each exiting thread
+    /// purge its jemalloc arena. That is the baseline arm; the judge is
+    /// `perf stat -e syscalls:sys_enter_madvise` and the `/proc/interrupts` TLB
+    /// row, not throughput.
+    MetadbCkptPool {
+        /// `on` / `off`; omit to just read the current state.
+        state: Option<String>,
+    },
     /// Read or flip the running engine's LV2 commit-log sync slab arena.
     ///
     /// Separate from `mem-arena` on purpose: one switch for both consumers
@@ -1304,6 +1315,23 @@ fn main() -> anyhow::Result<()> {
             let cmd = match state {
                 Some(s) => format!("mem-arena {s}"),
                 None => "mem-arena".to_string(),
+            };
+            for line in service::send_chunklet_command(sock, &cmd)? {
+                println!("{line}");
+            }
+        }
+        Command::MetadbCkptPool { state } => {
+            let sock = &config.service.socket_path;
+            if !sock.exists() {
+                anyhow::bail!(
+                    "metadb-ckpt-pool talks to a running engine (socket {:?} not found) — \
+                     start it first",
+                    sock
+                );
+            }
+            let cmd = match state {
+                Some(s) => format!("metadb-ckpt-pool {s}"),
+                None => "metadb-ckpt-pool".to_string(),
             };
             for line in service::send_chunklet_command(sock, &cmd)? {
                 println!("{line}");

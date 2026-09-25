@@ -847,6 +847,46 @@ impl ServiceController {
                     let _ = stream.write_all(msg.as_bytes());
                     let _ = stream.flush();
                 }
+                // metadb's two checkpoint fan-outs (L2P fold, rc sample) used
+                // `std::thread::scope`, i.e. 16 fresh threads per cycle, and
+                // each exiting thread ran jemalloc's `tsd_cleanup` ->
+                // `pac_decay_all`, purging every dirty extent it had built:
+                // ~954 `madvise(MADV_DONTNEED)` per exit, 3,815/s, each
+                // broadcasting a TLB-shootdown IPI to every CPU sharing the mm.
+                // `off` restores the scoped threads, which is the baseline arm
+                // for that measurement.
+                "metadb-ckpt-pool" => {
+                    if let Some(arg) = parts.get(1) {
+                        match *arg {
+                            "on" | "true" | "1" => {
+                                onyx_metadb::set_checkpoint_pool_enabled(true);
+                                tracing::info!("metadb checkpoint worker pool enabled");
+                            }
+                            "off" | "false" | "0" => {
+                                onyx_metadb::set_checkpoint_pool_enabled(false);
+                                tracing::info!(
+                                    "metadb checkpoint worker pool disabled (scoped threads)"
+                                );
+                            }
+                            _ => {
+                                let _ = stream
+                                    .write_all(b"error: usage: metadb-ckpt-pool [on|off]\n");
+                                let _ = stream.flush();
+                                continue;
+                            }
+                        }
+                    }
+                    let msg = format!(
+                        "{}\nok\n",
+                        if onyx_metadb::checkpoint_pool_enabled() {
+                            "on"
+                        } else {
+                            "off"
+                        }
+                    );
+                    let _ = stream.write_all(msg.as_bytes());
+                    let _ = stream.flush();
+                }
                 // Read or set the LV3 write-bundle width (design D1,
                 // `flush.stripe_run_max_stripes`): how many consecutive exactly-full
                 // stripe groups share one contiguous extent and therefore one write
