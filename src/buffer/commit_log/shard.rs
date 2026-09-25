@@ -501,6 +501,7 @@ impl BufferShard {
                 max_payload_memory,
                 max_flushed_seq,
                 durable_seq,
+                lv2_arena: OnceLock::new(),
             },
             scan.max_seq,
         ))
@@ -539,6 +540,26 @@ impl BufferShard {
         ckpt.max_seq = max_seq;
         ckpt_dev.write_at(&ckpt.encode(), 0)?;
         Ok(())
+    }
+
+    /// This shard's span-buffer arena, created on first call.
+    ///
+    /// ⚠ Only ever called from the thread running this shard's sync loop, which
+    /// is what makes the lazy creation correct: [`crate::mem::lv2_sync_arena`]
+    /// pre-faults on first take, and pre-faulting is what decides which NUMA
+    /// node the pages land on. Nothing else in the pool allocates span buffers.
+    ///
+    /// Returns `None` while `mem-arena-lv2` is off, so the A/B arm alternates
+    /// inside one process — an arm-per-restart on the perf box measures
+    /// run-order drift instead of the knob.
+    pub(super) fn lv2_arena(&self) -> Option<&Arc<SlabArena>> {
+        if !crate::mem::arena_lv2_enabled() {
+            return None;
+        }
+        Some(
+            self.lv2_arena
+                .get_or_init(|| crate::mem::lv2_sync_arena(self.metrics.clone())),
+        )
     }
 
     /// Encode the current checkpoint with the supplied max_seq, ready to be

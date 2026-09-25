@@ -156,6 +156,20 @@ enum Command {
         /// `on` / `off`; omit to just read the current state.
         state: Option<String>,
     },
+    /// Read or flip the running engine's LV2 commit-log sync slab arena.
+    ///
+    /// Separate from `mem-arena` on purpose: one switch for both consumers
+    /// would flip them together and then neither arm measures the consumer it
+    /// is named after. `off` puts `encode_entries_into_spans` back on
+    /// `AlignedBuf::new` -> `alloc_zeroed`, which jemalloc serves by purging a
+    /// recycled extent — one `madvise(MADV_DONTNEED)` and a TLB-shootdown IPI
+    /// to every CPU sharing the `mm`, per span buffer. That is the baseline
+    /// arm; `perf stat -e syscalls:sys_enter_madvise` and the `/proc/interrupts`
+    /// TLB row are how the two are told apart.
+    MemArenaLv2 {
+        /// `on` / `off`; omit to just read the current state.
+        state: Option<String>,
+    },
     /// Read or set the LV3 write-bundle width (`flush.stripe_run_max_stripes`).
     ///
     /// How many consecutive exactly-full stripe groups share one contiguous extent
@@ -1290,6 +1304,23 @@ fn main() -> anyhow::Result<()> {
             let cmd = match state {
                 Some(s) => format!("mem-arena {s}"),
                 None => "mem-arena".to_string(),
+            };
+            for line in service::send_chunklet_command(sock, &cmd)? {
+                println!("{line}");
+            }
+        }
+        Command::MemArenaLv2 { state } => {
+            let sock = &config.service.socket_path;
+            if !sock.exists() {
+                anyhow::bail!(
+                    "mem-arena-lv2 talks to a running engine (socket {:?} not found) — \
+                     start it first",
+                    sock
+                );
+            }
+            let cmd = match state {
+                Some(s) => format!("mem-arena-lv2 {s}"),
+                None => "mem-arena-lv2".to_string(),
             };
             for line in service::send_chunklet_command(sock, &cmd)? {
                 println!("{line}");

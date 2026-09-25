@@ -53,11 +53,12 @@
 //!    in the compress worker's scratch-buffer comment (~40 % of that thread).
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use parking_lot::Mutex;
 
 use super::classes::ClassTable;
+use super::registry::MemRole;
 use crate::error::{OnyxError, OnyxResult};
 use crate::io::aligned::{round_up, AlignedBuf};
 use crate::metrics::EngineMetrics;
@@ -79,6 +80,21 @@ struct Region {
     bytes: usize,
 }
 
+/// Late-bound `EngineMetrics`. The engine publishes its metrics into this
+/// `OnceLock` after the threads that allocate have already started, which is
+/// why an arena holds the cell rather than the value.
+pub type MetricsHandle = Arc<OnceLock<Arc<EngineMetrics>>>;
+
+/// One consumer's five counters in [`EngineMetrics`], resolved from
+/// [`SlabArena::role`].
+struct CounterGroup<'a> {
+    takes: &'a AtomicU64,
+    hits: &'a AtomicU64,
+    grows: &'a AtomicU64,
+    grow_bytes: &'a AtomicU64,
+    overflow: &'a AtomicU64,
+}
+
 /// A lane's slab arena. Cheap to clone as an `Arc`; every handed-out buffer holds
 /// one clone so the arena outlives its buffers on any thread.
 pub struct SlabArena {
@@ -88,7 +104,16 @@ pub struct SlabArena {
     resident_bytes: AtomicUsize,
     cap_bytes: usize,
     hugepage: bool,
-    metrics: Option<Arc<EngineMetrics>>,
+    /// Which consumer this arena serves, and therefore which counter group in
+    /// [`EngineMetrics`] it reports to. One group per consumer: the LV3 series
+    /// is what every historical `hits/takes` comparison means, so a second
+    /// consumer must not be summed into it.
+    role: MemRole,
+    /// ⚠ Resolved per bump, not captured. The LV2 sync threads are started by
+    /// `WriteBufferPool::open`, which runs before the engine installs its
+    /// `EngineMetrics`, so an arena built there would capture `None` and
+    /// silently report nothing for the rest of the process.
+    metrics: MetricsHandle,
     /// Releases seen on a thread other than the one that built the arena. Purely
     /// diagnostic — the release path is correct either way — so it is only
     /// tracked where it is free.
@@ -107,10 +132,27 @@ impl SlabArena {
     /// `max_class_blocks` blocks. Call this **on the owning thread and after
     /// `affinity::bind_current`** so the pre-faulted pages land NUMA-local.
     pub fn new(
+        role: MemRole,
         cap_bytes: usize,
         max_class_blocks: u32,
         hugepage: bool,
         metrics: Option<Arc<EngineMetrics>>,
+    ) -> Arc<Self> {
+        let handle: MetricsHandle = Arc::new(OnceLock::new());
+        if let Some(metrics) = metrics {
+            let _ = handle.set(metrics);
+        }
+        Self::new_deferred(role, cap_bytes, max_class_blocks, hugepage, handle)
+    }
+
+    /// Same, for a consumer whose `EngineMetrics` are not published yet — see
+    /// [`MetricsHandle`]. The LV2 sync threads are the reason this exists.
+    pub fn new_deferred(
+        role: MemRole,
+        cap_bytes: usize,
+        max_class_blocks: u32,
+        hugepage: bool,
+        metrics: MetricsHandle,
     ) -> Arc<Self> {
         let table = ClassTable::new(max_class_blocks);
         let bs = BLOCK_SIZE as usize;
@@ -127,6 +169,7 @@ impl SlabArena {
             resident_bytes: AtomicUsize::new(0),
             cap_bytes,
             hugepage,
+            role,
             metrics,
             #[cfg(debug_assertions)]
             foreign_releases: AtomicU64::new(0),
@@ -138,9 +181,32 @@ impl SlabArena {
         })
     }
 
+    /// This arena's counter group, or `None` when it was built without metrics
+    /// (tests and benches). Resolved per bump rather than stored as references,
+    /// so `SlabArena` stays free of a self-referential lifetime.
+    fn counters(&self) -> Option<CounterGroup<'_>> {
+        let metrics = self.metrics.get()?.as_ref();
+        Some(match self.role {
+            MemRole::Lv3Writer => CounterGroup {
+                takes: &metrics.mem_arena_takes,
+                hits: &metrics.mem_arena_hits,
+                grows: &metrics.mem_arena_grows,
+                grow_bytes: &metrics.mem_arena_grow_bytes,
+                overflow: &metrics.mem_arena_overflow,
+            },
+            MemRole::Lv2Sync => CounterGroup {
+                takes: &metrics.mem_arena_lv2_takes,
+                hits: &metrics.mem_arena_lv2_hits,
+                grows: &metrics.mem_arena_lv2_grows,
+                grow_bytes: &metrics.mem_arena_lv2_grow_bytes,
+                overflow: &metrics.mem_arena_lv2_overflow,
+            },
+        })
+    }
+
     /// Take a buffer of at least `size` bytes. Never fails because of the arena
     /// itself: an out-of-range size or an arena at its cap falls back to a heap
-    /// [`AlignedBuf`] and bumps `mem_arena.overflow`.
+    /// [`AlignedBuf`] and bumps this role's `overflow`.
     ///
     /// The returned buffer's `len` is `round_up(size, BLOCK_SIZE)` — the slot may
     /// be wider, and that width must never be visible to the device.
@@ -149,8 +215,8 @@ impl SlabArena {
         if aligned == 0 {
             return Err(OnyxError::Config("cannot allocate zero-size buffer".into()));
         }
-        if let Some(metrics) = &self.metrics {
-            metrics.mem_arena_takes.fetch_add(1, Ordering::Relaxed);
+        if let Some(counters) = self.counters() {
+            counters.takes.fetch_add(1, Ordering::Relaxed);
         }
         let blocks = (aligned / BLOCK_SIZE as usize) as u32;
         let Some(class) = self.table.class_of(blocks) else {
@@ -190,8 +256,8 @@ impl SlabArena {
         );
         self.live_slots.fetch_add(1, Ordering::Relaxed);
         if hit {
-            if let Some(metrics) = &self.metrics {
-                metrics.mem_arena_hits.fetch_add(1, Ordering::Relaxed);
+            if let Some(counters) = self.counters() {
+                counters.hits.fetch_add(1, Ordering::Relaxed);
             }
         }
         // SAFETY: `addr` is a slot inside a region this arena mapped and keeps
@@ -250,11 +316,9 @@ impl SlabArena {
         };
         regions.push(Region { addr, bytes });
         self.resident_bytes.fetch_add(bytes, Ordering::Relaxed);
-        if let Some(metrics) = &self.metrics {
-            metrics.mem_arena_grows.fetch_add(1, Ordering::Relaxed);
-            metrics
-                .mem_arena_grow_bytes
-                .fetch_add(bytes as u64, Ordering::Relaxed);
+        if let Some(counters) = self.counters() {
+            counters.grows.fetch_add(1, Ordering::Relaxed);
+            counters.grow_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
         }
         // Hand out the first slot directly and park the rest.
         {
@@ -268,9 +332,13 @@ impl SlabArena {
     }
 
     fn overflow(&self, aligned: usize) -> OnyxResult<AlignedBuf> {
-        if let Some(metrics) = &self.metrics {
-            metrics.mem_arena_overflow.fetch_add(1, Ordering::Relaxed);
+        if let Some(counters) = self.counters() {
+            counters.overflow.fetch_add(1, Ordering::Relaxed);
         }
+        // Heap fallback, and therefore back on the `alloc_zeroed` -> jemalloc
+        // purge -> madvise path this arena exists to avoid. Contents are
+        // undefined either way, so the caller's cover-every-byte obligation
+        // (invariant 3) is unchanged.
         AlignedBuf::new(aligned, false)
     }
 
@@ -358,7 +426,7 @@ mod tests {
     use super::*;
 
     fn arena(cap: usize) -> Arc<SlabArena> {
-        SlabArena::new(cap, 64, false, None)
+        SlabArena::new(MemRole::Lv3Writer, cap, 64, false, None)
     }
 
     #[test]

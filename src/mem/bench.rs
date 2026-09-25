@@ -117,7 +117,13 @@ fn bench_lv3_write_buffer_arms() {
     let bs = BLOCK_SIZE as usize;
     // Big enough that the arena never falls back: 301 live 24 KiB buffers = 7.2
     // MiB, matching the measured per-lane working set.
-    let arena = SlabArena::new(32 * 1024 * 1024, 64, false, None);
+    let arena = SlabArena::new(
+        crate::mem::MemRole::Lv3Writer,
+        32 * 1024 * 1024,
+        64,
+        false,
+        None,
+    );
 
     println!(
         "\n== LV3 write buffer, {} x {} KiB per cycle, all live at once ==",

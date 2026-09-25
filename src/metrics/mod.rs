@@ -540,6 +540,17 @@ pub struct EngineMetrics {
     pub mem_arena_grows: AtomicU64,
     pub mem_arena_grow_bytes: AtomicU64,
     pub mem_arena_overflow: AtomicU64,
+    /// The same five counters for the LV2 commit-log sync arena.
+    ///
+    /// ⚠ Deliberately a SECOND group rather than more traffic through the five
+    /// above: those are the LV3 writer's historical series, and every
+    /// cross-session comparison of `hits/takes` assumes they mean LV3 only.
+    /// A consumer gets its own group — see `crate::mem::MemRole`.
+    pub mem_arena_lv2_takes: AtomicU64,
+    pub mem_arena_lv2_hits: AtomicU64,
+    pub mem_arena_lv2_grows: AtomicU64,
+    pub mem_arena_lv2_grow_bytes: AtomicU64,
+    pub mem_arena_lv2_overflow: AtomicU64,
     /// Bytes the LV3 writer had to zero because the run layout left a gap. The
     /// old blanket `fill(0)` zeroed the whole buffer instead; box-measured
     /// `payload/slab = 100 %`, so in the healthy full-stripe shape this stays

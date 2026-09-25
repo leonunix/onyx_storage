@@ -17,10 +17,21 @@
 //!   `fill(0)` cannot leak a recycled slot's previous content to disk.
 //! - [`MemRegistry`] — one owner per engine, keyed by `(role, lane)`.
 //!
-//! Consumers wired up so far: the LV3 flush writer's run and unit buffers
-//! (`buffer::flush::writer::passthrough`). Everything else still uses the heap;
-//! new consumers are expected to arrive with their own measurement, not on
-//! principle.
+//! Consumers wired up so far, each with its own measurement and its own counter
+//! group:
+//!
+//! - the LV3 flush writer's run and unit buffers
+//!   (`buffer::flush::writer::passthrough`);
+//! - the LV2 commit-log sync span buffers
+//!   (`buffer::commit_log::pool::sync::encode_entries_into_spans`), which a
+//!   2026-09-24 in-engine `perf` profile caught issuing **62 % of the box's
+//!   20.7k madvise/s** — `alloc_zeroed` on a recycled jemalloc extent is
+//!   satisfied by purging it, so every span buffer cost one `MADV_DONTNEED`
+//!   plus a TLB-shootdown IPI to all ~39 CPUs sharing the `mm`
+//!   (memory `perf_inside_engine_first_cpu_ledger`).
+//!
+//! Everything else still uses the heap; new consumers are expected to arrive
+//! with their own measurement, not on principle.
 
 mod arena;
 #[cfg(test)]
@@ -29,7 +40,7 @@ mod classes;
 mod fill;
 mod registry;
 
-pub use arena::SlabArena;
+pub use arena::{MetricsHandle, SlabArena};
 pub use classes::ClassTable;
 pub use fill::SlabFill;
 pub use registry::{MemRegistry, MemRole, MemTotals};
@@ -51,6 +62,10 @@ const DEFAULT_ARENA_MAX_CLASS_BLOCKS: u32 = 64;
 // Runtime-overridable so an arm can be run without a rebuild, matching
 // `io::engine::set_lv3_batch_tuning`. `0` keeps the compiled default.
 static ARENA_ENABLED: AtomicBool = AtomicBool::new(true);
+/// LV2's own switch, deliberately independent of [`ARENA_ENABLED`]. One flag for
+/// both consumers would flip them together, and then neither arm measures the
+/// consumer it is named after.
+static ARENA_LV2_ENABLED: AtomicBool = AtomicBool::new(true);
 static ARENA_MAX_BYTES_PER_LANE: AtomicUsize = AtomicUsize::new(0);
 static ARENA_MAX_CLASS_BLOCKS: AtomicUsize = AtomicUsize::new(0);
 static ARENA_HUGEPAGE: AtomicBool = AtomicBool::new(false);
@@ -90,6 +105,48 @@ pub fn arena_enabled() -> bool {
 /// arenas mapped and idle — flipping back needs no re-fault.
 pub fn set_arena_enabled(enabled: bool) {
     ARENA_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Whether the LV2 commit-log sync arena is in force **right now**.
+///
+/// Separate from [`arena_enabled`] so the two consumers are separately
+/// A/B-able inside one process; read per allocation for the same reason.
+pub fn arena_lv2_enabled() -> bool {
+    ARENA_LV2_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Flip the LV2 sync arena on/off in a running engine (IPC `mem-arena-lv2 on|off`).
+///
+/// Safe mid-run for the same reason as [`set_arena_enabled`]: provenance travels
+/// with each buffer, so a span buffer taken before a flip is released to the
+/// right place after it.
+pub fn set_arena_lv2_enabled(enabled: bool) {
+    ARENA_LV2_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Build one LV2 commit-log sync arena, using the same `[mem]` knobs as the LV3
+/// ones.
+///
+/// ⚠ Must be called **on the thread that runs the shard's sync loop and after
+/// `affinity::bind_current`**: the first take maps and pre-faults memory, and
+/// pre-faulting is what puts the pages on the caller's NUMA node.
+///
+/// Not routed through [`MemRegistry`] on purpose. The registry is created by
+/// the flush runtime, which starts *after* `WriteBufferPool::open` has already
+/// spawned these threads; threading it in would have meant a new parameter on
+/// `open_with_options_full_and_limits` and its 24 test call sites, for an owner
+/// whose only extra service (`MemTotals`) nothing reads. The shard's
+/// `OnceLock` gives the same "exactly one arena per (role, lane), outliving
+/// every buffer it handed out" guarantee, and `mem_arena_lv2_grow_bytes`
+/// reports the resident footprint.
+pub fn lv2_sync_arena(metrics: MetricsHandle) -> std::sync::Arc<SlabArena> {
+    SlabArena::new_deferred(
+        MemRole::Lv2Sync,
+        arena_max_bytes_per_lane(),
+        arena_max_class_blocks(),
+        arena_hugepage(),
+        metrics,
+    )
 }
 
 fn arena_max_bytes_per_lane() -> usize {

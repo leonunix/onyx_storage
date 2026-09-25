@@ -1381,6 +1381,23 @@ impl EngineStatusSnapshot {
             self.metrics.mem_arena_overflow,
             self.metrics.mem_slab_zero_bytes
         );
+        // The LV2 commit-log sync arena, reported separately so the LV3 series
+        // above keeps its historical meaning. This one exists to kill the
+        // `alloc_zeroed` -> jemalloc purge -> `madvise` -> cross-CPU TLB
+        // shootdown chain that was 62 % of the box's 20.7k madvise/s
+        // (memory `perf_inside_engine_first_cpu_ledger`), so `hits/takes` ~ 1 and
+        // `overflow` = 0 IS the proof that the chain is gone. `overflow` counting
+        // up means a span was wider than the class table and went back to the
+        // heap — i.e. still paying the madvise.
+        let _ = writeln!(
+            out,
+            "mem_arena_lv2: takes={} hits={} grows={} grow_bytes={} overflow={}",
+            self.metrics.mem_arena_lv2_takes,
+            self.metrics.mem_arena_lv2_hits,
+            self.metrics.mem_arena_lv2_grows,
+            self.metrics.mem_arena_lv2_grow_bytes,
+            self.metrics.mem_arena_lv2_overflow
+        );
         let _ = writeln!(
             out,
             "read_pool: requests={} batches={} batch_ops={} queue_wait_ns={} coalesce_wait_ns={} alloc_ns={} submit_wait_ns={} decode_ns={} workers={} fg_workers={}",

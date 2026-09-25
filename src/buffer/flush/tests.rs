@@ -130,7 +130,7 @@ fn stripe_io_engine(
 /// makes the existing passthrough tests exercise the arena path that production
 /// uses, including recycling a dirty slot between cycles.
 fn test_arena() -> Arc<crate::mem::SlabArena> {
-    crate::mem::SlabArena::new(8 * 1024 * 1024, 64, false, None)
+    crate::mem::SlabArena::new(crate::mem::MemRole::Lv3Writer, 8 * 1024 * 1024, 64, false, None)
 }
 
 /// Build a `PbaLifecycle` for tests that exercise the cleanup/retire path

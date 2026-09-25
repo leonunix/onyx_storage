@@ -807,6 +807,46 @@ impl ServiceController {
                     let _ = stream.write_all(msg.as_bytes());
                     let _ = stream.flush();
                 }
+                // The same switch for the LV2 commit-log sync arena, separate
+                // from `mem-arena` so the two consumers are separately
+                // measurable: one flag for both would flip them together and
+                // then neither arm measures the consumer it is named after.
+                //
+                // This is the arm for the madvise/TLB-shootdown work — with it
+                // off, every span buffer goes back to `alloc_zeroed` and
+                // jemalloc's purge-to-zero, which is what
+                // `perf stat -e syscalls:sys_enter_madvise` and the
+                // `/proc/interrupts` TLB row should then show.
+                "mem-arena-lv2" => {
+                    if let Some(arg) = parts.get(1) {
+                        match *arg {
+                            "on" | "true" | "1" => {
+                                crate::mem::set_arena_lv2_enabled(true);
+                                tracing::info!("LV2 sync slab arena enabled");
+                            }
+                            "off" | "false" | "0" => {
+                                crate::mem::set_arena_lv2_enabled(false);
+                                tracing::info!("LV2 sync slab arena disabled (heap path)");
+                            }
+                            _ => {
+                                let _ = stream
+                                    .write_all(b"error: usage: mem-arena-lv2 [on|off]\n");
+                                let _ = stream.flush();
+                                continue;
+                            }
+                        }
+                    }
+                    let msg = format!(
+                        "{}\nok\n",
+                        if crate::mem::arena_lv2_enabled() {
+                            "on"
+                        } else {
+                            "off"
+                        }
+                    );
+                    let _ = stream.write_all(msg.as_bytes());
+                    let _ = stream.flush();
+                }
                 // Read or set the LV3 write-bundle width (design D1,
                 // `flush.stripe_run_max_stripes`): how many consecutive exactly-full
                 // stripe groups share one contiguous extent and therefore one write

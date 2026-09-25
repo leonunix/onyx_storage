@@ -26,6 +26,17 @@ use crate::metrics::EngineMetrics;
 pub enum MemRole {
     /// LV3 flush writer, one arena per buffer shard (`shard_idx` = lane).
     Lv3Writer,
+    /// LV2 commit-log sync, one arena per buffer shard, owned by that shard
+    /// rather than by this registry — see [`crate::mem::lv2_sync_arena`] for
+    /// why. Present here because a role also selects a counter group.
+    ///
+    /// Measured need: that thread class issued **62 % of the box's 20.7k
+    /// madvise/s**, because `encode_entries_into_spans` asks `AlignedBuf::new`
+    /// for a span buffer per ~1.4 write ops and jemalloc satisfies the
+    /// `alloc_zeroed` on a recycled extent by purging it — one
+    /// `MADV_DONTNEED` and a TLB-shootdown IPI to all ~39 CPUs sharing the
+    /// `mm`. See memory `perf_inside_engine_first_cpu_ledger`.
+    Lv2Sync,
 }
 
 /// Resident totals across every arena this registry owns.
@@ -89,6 +100,7 @@ impl MemRegistry {
             .entry((role, lane))
             .or_insert_with(|| {
                 SlabArena::new(
+                    role,
                     self.cap_bytes_per_lane,
                     self.max_class_blocks,
                     self.hugepage,

@@ -93,19 +93,40 @@ struct OpenBatch {
 }
 
 impl WriteBufferPool {
-    /// Encode each staged entry directly into a pooled `AlignedBuf`,
-    /// coalescing entries whose reserved disk ranges are contiguous into a
-    /// single buffer. This replaces the old "encode into a fresh
-    /// `vec![0u8; n]` per entry, then memcpy into an AlignedBuf" two-pass:
-    /// the per-entry Vec was a jemalloc large-class allocation, so freeing
-    /// it drove `madvise(MADV_DONTNEED)` → cross-core TLB-shootdown IPIs on
-    /// the LV2 sync thread (perf 2026-05-29: ~10% aggregate on-CPU, smeared
-    /// across all cores). Encoding straight into the span buffer's
-    /// sub-slice via `encode_full_into_slice` removes that allocation, the
-    /// extra memcpy, and the redundant zero-fill. The single AlignedBuf per
-    /// span hits the thread-local pool ([`AlignedBuf::new`]) and stays
-    /// resident, so no madvise churn remains.
-    fn encode_entries_into_spans(entries: &[StagedEntry]) -> OnyxResult<Vec<CoalescedSpan>> {
+    /// Encode each staged entry directly into an `AlignedBuf`, coalescing
+    /// entries whose reserved disk ranges are contiguous into a single buffer.
+    ///
+    /// This replaces the old "encode into a fresh `vec![0u8; n]` per entry,
+    /// then memcpy into an AlignedBuf" two-pass: the per-entry Vec was a
+    /// jemalloc large-class allocation, so freeing it drove
+    /// `madvise(MADV_DONTNEED)` → cross-core TLB-shootdown IPIs on the LV2 sync
+    /// thread (perf 2026-05-29: ~10% aggregate on-CPU, smeared across all
+    /// cores). Encoding straight into the span buffer's sub-slice via
+    /// `encode_full_into_slice` removes that allocation, the extra memcpy, and
+    /// the redundant zero-fill.
+    ///
+    /// ⛔ That change did NOT end the madvise churn, contrary to what this
+    /// comment used to claim. It moved it from the per-entry `Vec` to the span
+    /// buffer itself: `AlignedBuf::new`'s thread-local pool only reuses a
+    /// parked buffer whose capacity already fits, an LV2 span's length is a
+    /// wide random variable under a 4k-32k workload, and every miss calls
+    /// `alloc_zeroed` — which jemalloc satisfies off a recycled extent by
+    /// purging it. A 2026-09-24 in-engine `perf` profile caught this thread
+    /// class at ~12.9k madvise/s, **62 % of the box's 20.7k/s**, driving
+    /// ~810k TLB-shootdown IPIs/s for ~2.8 CPUs of the machine's 53.4 busy
+    /// (memory `perf_inside_engine_first_cpu_ledger`).
+    ///
+    /// ⭐ So `arena` is the fix, not the pool: a [`crate::mem::SlabArena`] slot
+    /// is pre-faulted once and never returned to the OS. The precondition is
+    /// the arena's invariant 3, "slots come back dirty, cover every byte you
+    /// submit" — which this function already satisfied, because
+    /// `encode_full_into_slice` writes the whole `[0..disk_len)` of each entry
+    /// (padding included) and `total_len` is exactly the sum of those. The
+    /// `alloc_zeroed` was pure waste on this path even before it was measured.
+    fn encode_entries_into_spans(
+        entries: &[StagedEntry],
+        arena: Option<&Arc<SlabArena>>,
+    ) -> OnyxResult<Vec<CoalescedSpan>> {
         let mut spans: Vec<CoalescedSpan> = Vec::new();
         let mut start = 0usize;
         while start < entries.len() {
@@ -118,7 +139,10 @@ impl WriteBufferPool {
             }
             let span = &entries[start..end];
             let total_len: usize = span.iter().map(|e| e.pending.disk_len as usize).sum();
-            let mut buf = AlignedBuf::new(total_len, false)?;
+            let mut buf = match arena {
+                Some(arena) => arena.take(total_len)?,
+                None => AlignedBuf::new(total_len, false)?,
+            };
             {
                 let dst = buf.as_mut_slice();
                 let mut cursor = 0usize;
@@ -190,6 +214,7 @@ impl WriteBufferPool {
     )]
     fn write_batch(
         device: &dyn BlockBackend,
+        shard: &BufferShard,
         io_lock: &parking_lot::Mutex<()>,
         entries: &[StagedEntry],
         metrics: &Arc<OnceLock<Arc<EngineMetrics>>>,
@@ -198,7 +223,7 @@ impl WriteBufferPool {
             return Ok(());
         }
 
-        let spans = Self::encode_entries_into_spans(entries)?;
+        let spans = Self::encode_entries_into_spans(entries, shard.lv2_arena())?;
 
         #[cfg(any(test, feature = "diagnostic-metrics"))]
         let write_start = Instant::now();
@@ -298,7 +323,7 @@ impl WriteBufferPool {
         //    coalescing contiguous reserved ranges into one buffer per span
         //    (one write SQE each). See `encode_entries_into_spans` for why
         //    this avoids the per-entry Vec / madvise-TLB-IPI churn.
-        let spans = Self::encode_entries_into_spans(entries)?;
+        let spans = Self::encode_entries_into_spans(entries, shard.lv2_arena())?;
 
         // 3. Optional checkpoint payload (only when the shard has a checkpoint
         //    device — same condition as `write_checkpoint`).
@@ -306,7 +331,11 @@ impl WriteBufferPool {
         let checkpoint_target = shard.checkpoint_target();
         let mut ckpt_aligned: Option<AlignedBuf> = None;
         if let (Some(payload), Some(_)) = (&checkpoint_payload, checkpoint_target) {
-            let mut buf = AlignedBuf::new(BLOCK_SIZE as usize, false)?;
+            // `new_zeroed`: the whole 4 KiB block is written but only
+            // `[..payload.len()]` is filled, and `AlignedBuf::new` guarantees
+            // nothing about the rest. Once per sync cycle, so the memset is
+            // not on a hot path.
+            let mut buf = AlignedBuf::new_zeroed(BLOCK_SIZE as usize, false)?;
             buf.as_mut_slice()[..payload.len()].copy_from_slice(payload);
             ckpt_aligned = Some(buf);
         }
@@ -601,7 +630,7 @@ impl WriteBufferPool {
         // their seq). OOM here means the system is already collapsing; the
         // serial path likewise retries its inflight batch indefinitely.
         let spans = loop {
-            match Self::encode_entries_into_spans(&to_persist) {
+            match Self::encode_entries_into_spans(&to_persist, shard.lv2_arena()) {
                 Ok(s) => break s,
                 Err(e) => {
                     tracing::error!(error = %e, "uring pipeline encode failed; retrying");
@@ -612,7 +641,9 @@ impl WriteBufferPool {
 
         let ckpt_payload = shard.encode_checkpoint_for_uring(max_seq);
         let ckpt_buf = match (&ckpt_payload, ckpt_target) {
-            (Some(payload), Some(_)) => match AlignedBuf::new(BLOCK_SIZE as usize, false) {
+            // `new_zeroed` for the same reason as the non-pipelined path above:
+            // a full block is submitted, only its head is filled.
+            (Some(payload), Some(_)) => match AlignedBuf::new_zeroed(BLOCK_SIZE as usize, false) {
                 Ok(mut buf) => {
                     buf.as_mut_slice()[..payload.len()].copy_from_slice(payload);
                     Some(buf)
@@ -1266,7 +1297,7 @@ impl WriteBufferPool {
                                 .collect::<Vec<_>>()
                         };
                         let spans = loop {
-                            match Self::encode_entries_into_spans(&persist) {
+                            match Self::encode_entries_into_spans(&persist, shard.lv2_arena()) {
                                 Ok(spans) => break spans,
                                 Err(error) => {
                                     tracing::error!(
@@ -2051,6 +2082,7 @@ impl WriteBufferPool {
                     // below provide the ack-after-durable barrier.
                     _ => Self::write_batch(
                         device.as_ref(),
+                        &shard,
                         &shard.io_lock,
                         &writes_to_persist,
                         &metrics,
@@ -2212,6 +2244,165 @@ impl WriteBufferPool {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod span_encode_tests {
+    use super::*;
+    use crate::mem::{MemRole, SlabArena};
+    use std::sync::atomic::AtomicU64;
+
+    /// Byte the arena slot is poisoned with. Distinct from the payload pattern
+    /// so a survivor is unambiguous.
+    const POISON: u8 = 0xAA;
+    const PAYLOAD_BYTE: u8 = 0x5A;
+
+    fn staged(seq: u64, lba: u64, payload_len: usize, disk_offset: u64) -> StagedEntry {
+        let payload: Arc<[u8]> = vec![PAYLOAD_BYTE; payload_len].into();
+        let raw = BufferEntry::raw_size_for("span-vol", payload.len());
+        let disk_len = round_up(raw, BLOCK_SIZE as usize) as u32;
+        let pending = Arc::new(PendingEntry {
+            seq,
+            vol_id: "span-vol".to_string(),
+            start_lba: Lba(lba),
+            lba_count: 1,
+            payload_crc32: crc32fast::hash(&payload),
+            vol_created_at: 7,
+            relocation_source: None,
+            payload: Some(payload.clone()),
+            disk_offset,
+            disk_len,
+            enqueued_at: Instant::now(),
+            durability_advanced_at_ns: AtomicU64::new(0),
+            superseded_ranges: Vec::new(),
+        });
+        StagedEntry {
+            pending,
+            payload,
+            staged_at: Instant::now(),
+        }
+    }
+
+    /// Two contiguous entries, so they coalesce into one span, plus a
+    /// discontiguous third.
+    fn three_entries() -> Vec<StagedEntry> {
+        let first = staged(1, 0, 4096, 0);
+        let first_len = first.pending.disk_len as u64;
+        let second = staged(2, 1, 8192, first_len);
+        let second_len = second.pending.disk_len as u64;
+        // Leave a gap so this one starts its own span.
+        let third = staged(3, 2, 4096, first_len + second_len + 4096);
+        vec![first, second, third]
+    }
+
+    fn arena() -> Arc<SlabArena> {
+        SlabArena::new(MemRole::Lv2Sync, 8 * 1024 * 1024, 64, false, None)
+    }
+
+    /// ⭐ THE decisive test for dropping `alloc_zeroed` on this path: an arena
+    /// slot comes back dirty (arena invariant 3), so if the encoder did not
+    /// cover every byte it submits, the previous user's bytes would reach LV2.
+    ///
+    /// The poison is planted in the very slots the encode then takes: take and
+    /// dirty buffers of the same sizes, drop them so they return to their class
+    /// free stacks, then encode and assert not one poison byte survives inside
+    /// any span's submitted range.
+    #[test]
+    fn arena_span_encode_covers_every_submitted_byte() {
+        let arena = arena();
+        let entries = three_entries();
+
+        // Plant the poison in the classes the spans will ask for.
+        let sizes: Vec<usize> = vec![
+            (entries[0].pending.disk_len + entries[1].pending.disk_len) as usize,
+            entries[2].pending.disk_len as usize,
+        ];
+        for size in &sizes {
+            let mut dirty = arena.take(*size).unwrap();
+            dirty.as_mut_slice().fill(POISON);
+        }
+        assert_eq!(arena.live_slots(), 0, "poison buffers must be released");
+
+        let spans =
+            WriteBufferPool::encode_entries_into_spans(&entries, Some(&arena)).unwrap();
+        assert_eq!(spans.len(), 2, "two contiguous entries must share one span");
+
+        for span in &spans {
+            let submitted = &span.buf.as_slice()[..span.len as usize];
+            assert!(
+                !submitted.contains(&POISON),
+                "a recycled slot's byte reached the submitted range at offset {}",
+                span.offset
+            );
+        }
+        assert_eq!(
+            spans.iter().map(|s| s.len as usize).sum::<usize>(),
+            sizes.iter().sum::<usize>(),
+            "span lengths must be the sum of the entries' disk_len"
+        );
+    }
+
+    /// Invariant 2: the class-rounded slot width must never reach the device.
+    /// `CoalescedSpan::len` is what every submit path uses, so it must stay the
+    /// requested length even when the slot behind it is wider.
+    #[test]
+    fn span_len_is_the_request_not_the_slot_width() {
+        let arena = arena();
+        // 4 KiB + 8 KiB + headers rounds to a size the class table serves
+        // exactly, so ask for something that must land in a wider class: a
+        // 3-block span against the exact 1..16-block classes stays exact, so
+        // use a large odd span instead.
+        let entry = staged(1, 0, 17 * 4096, 0);
+        let expected = entry.pending.disk_len as usize;
+        let spans =
+            WriteBufferPool::encode_entries_into_spans(&[entry], Some(&arena)).unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].len as usize, expected);
+        assert!(
+            spans[0].buf.len() >= expected,
+            "capacity may be wider than the request, never narrower"
+        );
+    }
+
+    /// The arena path and the heap path must produce identical bytes — that is
+    /// what makes `mem-arena-lv2 off` a valid A/B baseline rather than a
+    /// different workload.
+    #[test]
+    fn arena_and_heap_paths_encode_identical_bytes() {
+        let arena = arena();
+        let entries = three_entries();
+        let with_arena =
+            WriteBufferPool::encode_entries_into_spans(&entries, Some(&arena)).unwrap();
+        let with_heap = WriteBufferPool::encode_entries_into_spans(&entries, None).unwrap();
+        assert_eq!(with_arena.len(), with_heap.len());
+        for (a, h) in with_arena.iter().zip(with_heap.iter()) {
+            assert_eq!(a.offset, h.offset);
+            assert_eq!(a.len, h.len);
+            assert_eq!(
+                &a.buf.as_slice()[..a.len as usize],
+                &h.buf.as_slice()[..h.len as usize],
+                "arena and heap encodes must be byte-identical at offset {}",
+                a.offset
+            );
+        }
+    }
+
+    /// Span buffers outlive the encoding thread in the pipelined sync path
+    /// (`InflightUringBatch` holds them until the kernel harvests the chain),
+    /// so releasing one from a foreign thread has to return the slot.
+    #[test]
+    fn spans_release_their_slots_from_a_foreign_thread() {
+        let arena = arena();
+        let spans =
+            WriteBufferPool::encode_entries_into_spans(&three_entries(), Some(&arena)).unwrap();
+        assert_eq!(arena.live_slots(), 2);
+        std::thread::spawn(move || drop(spans)).join().unwrap();
+        assert_eq!(
+            arena.live_slots(),
+            0,
+            "a foreign-thread drop must still return the slot"
+        );
     }
 }
 

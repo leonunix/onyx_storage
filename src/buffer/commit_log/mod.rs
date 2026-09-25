@@ -17,6 +17,7 @@ use crate::io::aligned::{round_up, AlignedBuf};
 use crate::io::block_backend::{slice_backend, BlockBackend};
 use crate::io::device::RawDevice;
 use crate::io::uring::{IoUringSession, LinkedOp, LinkedSubmitOutcome, UringOp, UringOpResult};
+use crate::mem::SlabArena;
 use crate::meta::schema::MAX_VOLUME_ID_BYTES;
 use crate::metrics::{BufferShardSnapshot, EngineMetrics, ForegroundIoLease};
 use crate::types::{Lba, BLOCK_SIZE};
@@ -1268,6 +1269,21 @@ struct BufferShard {
     /// engine-owned durability-watermark thread. `reclaim_log_prefix` only
     /// advances the tail past entries whose seq ≤ this.
     durable_seq: Arc<AtomicU64>,
+    /// Slab arena for this shard's span buffers, created on first use by the
+    /// thread running its sync loop (per-shard thread, or the `-global`
+    /// coordinator when that topology is in force) — which is exactly the
+    /// thread whose NUMA node the pre-faulted pages must land on.
+    ///
+    /// Why it exists: `encode_entries_into_spans` asked `AlignedBuf::new` for a
+    /// span buffer per ~1.4 write ops, the thread-local pool missed almost
+    /// always (its hit condition is `capacity >= size` and span length is a
+    /// wide random variable under 4k-32k), and jemalloc served each
+    /// `alloc_zeroed` off a recycled extent by purging it — one
+    /// `MADV_DONTNEED` plus a TLB-shootdown IPI to all ~39 CPUs sharing the
+    /// `mm`. Measured 2026-09-24 at ~12.9k madvise/s, 62 % of the box's total,
+    /// for ~2.8 CPUs of the machine's 53.4 busy
+    /// (memory `perf_inside_engine_first_cpu_ledger`).
+    lv2_arena: OnceLock<Arc<SlabArena>>,
 }
 
 pub struct WriteBufferPool {
