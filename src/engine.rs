@@ -394,6 +394,29 @@ impl OnyxEngine {
         );
     }
 
+    /// Publish `[meta] page_pool_*` to metadb's process-wide `Page` buffer
+    /// pool. Safe at any point: the pool only decides where the NEXT page
+    /// buffer comes from and goes to.
+    fn apply_metadb_page_pool(config: &OnyxConfig) {
+        onyx_metadb::set_page_pool_max_free_bytes(Self::page_pool_cap_bytes(&config.meta));
+        onyx_metadb::set_page_pool_enabled(config.meta.page_pool_enabled);
+    }
+
+    /// The pool's global-stack cap: the configured value, else an eighth of
+    /// metadb's page cache budget with a 1 GiB floor. The pool has to cover
+    /// the page-lifecycle swing between a checkpoint's seal and the release of
+    /// the versions it replaces, and that swing grows with the dirty set the
+    /// cache budget admits. Box 2026-09-29 under ring pressure: peak
+    /// 853,728 free pages (3.26 GiB) on a 32 GiB cache, where a 1 GiB cap
+    /// missed 8.7 % and overflowed 9.3k pages/s at the same time.
+    fn page_pool_cap_bytes(meta: &crate::config::MetaConfig) -> usize {
+        const FLOOR: usize = 1 << 30;
+        if meta.page_pool_max_free_bytes > 0 {
+            return usize::try_from(meta.page_pool_max_free_bytes).unwrap_or(usize::MAX);
+        }
+        (meta.block_cache_bytes() / 8).max(FLOOR)
+    }
+
     fn configured_chunklet_io_scheduler(
         config: &OnyxConfig,
     ) -> OnyxResult<Option<Arc<ChunkletIoScheduler>>> {
@@ -941,6 +964,7 @@ impl OnyxEngine {
         Self::validate_dedup_read_pool(config)?;
         Self::validate_meta_backend(config)?;
         Self::apply_mem_tuning(config);
+        Self::apply_metadb_page_pool(config);
 
         // 1. Chunklet RAID Pool (opened once; meta + LV3 + LV2 all share it) —
         //    None when [chunklet] is disabled. Opened BEFORE metadb because the
@@ -2039,6 +2063,7 @@ impl OnyxEngine {
         Self::validate_dedup_read_pool(config)?;
         Self::validate_meta_backend(config)?;
         Self::apply_mem_tuning(config);
+        Self::apply_metadb_page_pool(config);
         let lifecycle = Arc::new(VolumeLifecycleManager::default());
         let metrics = Arc::new(EngineMetrics::default());
         let generation_clock = Self::seed_generation_clock(&meta)?;
@@ -2665,6 +2690,18 @@ mod tests {
         // Every OnyxConfig field is `#[serde(default)]`, so an empty document
         // yields the all-defaults config.
         toml::from_str("").expect("empty toml -> all serde defaults")
+    }
+
+    #[test]
+    fn page_pool_cap_is_an_eighth_of_the_page_cache_with_a_1gib_floor() {
+        const GIB: usize = 1 << 30;
+        let mut meta = default_config().meta;
+        meta.block_cache_mb = 32 * 1024;
+        assert_eq!(OnyxEngine::page_pool_cap_bytes(&meta), 4 * GIB);
+        meta.block_cache_mb = 2 * 1024;
+        assert_eq!(OnyxEngine::page_pool_cap_bytes(&meta), GIB, "the floor");
+        meta.page_pool_max_free_bytes = 512 << 20;
+        assert_eq!(OnyxEngine::page_pool_cap_bytes(&meta), 512 << 20, "explicit config wins");
     }
 
     #[test]

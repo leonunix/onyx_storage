@@ -941,6 +941,25 @@ pub struct MetaConfig {
     /// (existing `rc==0` exclusive PBAs would be mass-premature-freed).
     #[serde(default = "default_rc_authoritative_reclaim")]
     pub rc_authoritative_reclaim: bool,
+
+    /// Recycle metadb's 4 KiB `Page` buffers through its process-wide pool
+    /// instead of the heap. A 4 KiB heap buffer is a jemalloc slab of its own,
+    /// so every page alloc/free was an extent operation and every freed page a
+    /// dirty extent to purge (`madvise` + a TLB-shootdown broadcast); the
+    /// checkpoint thread spent 22.4 % of its CPU in the allocator on exactly
+    /// that. Default on; also flippable live with `metadb-page-pool on|off`.
+    #[serde(default = "default_true")]
+    pub page_pool_enabled: bool,
+    /// Cap on the free buffers the pool's global stack keeps, in bytes (past it
+    /// a release goes back to the heap). `0` = an eighth of `block_cache_mb`
+    /// (metadb's page cache budget) with a 1 GiB floor — 4 GiB on the box's
+    /// 32 GiB cache. The cap has to cover the page-lifecycle swing between a
+    /// checkpoint's seal and the release of what it replaces, which measured
+    /// 3.26 GiB peak under ring pressure; a 1 GiB cap missed and overflowed
+    /// at once there. The pool never pre-allocates, so the cap bounds memory;
+    /// it is not a reservation.
+    #[serde(default)]
+    pub page_pool_max_free_bytes: u64,
 }
 
 impl MetaConfig {
@@ -1058,6 +1077,8 @@ impl Default for MetaConfig {
             l2p_drain_chunk_entries: default_l2p_drain_chunk_entries(),
             l2p_checkpoint_pipeline_enabled: default_l2p_checkpoint_pipeline_enabled(),
             rc_authoritative_reclaim: default_rc_authoritative_reclaim(),
+            page_pool_enabled: true,
+            page_pool_max_free_bytes: 0,
         }
     }
 }

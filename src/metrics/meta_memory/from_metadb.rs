@@ -10,6 +10,8 @@ impl MetaMemorySnapshot {
         meta: onyx_metadb::MetaMetricsSnapshot,
         pending: onyx_metadb::PendingState,
     ) -> Self {
+        // Process-wide, not per-Db: read here so every snapshot carries it.
+        let page_pool = onyx_metadb::page_pool_stats();
         Self {
             rc_checkpoint_mode: meta.rc_checkpoint_mode,
             checkpoint_sync_bfg: meta.checkpoint_sync_bfg,
@@ -44,6 +46,15 @@ impl MetaMemorySnapshot {
             cache_capacity_bytes: cache.capacity_bytes,
             cache_pinned_pages: cache.pinned_pages,
             cache_pin_budget_bytes: cache.pin_budget_bytes,
+            page_pool_enabled: page_pool.enabled,
+            page_pool_takes: page_pool.takes,
+            page_pool_fresh: page_pool.fresh,
+            page_pool_releases: page_pool.releases,
+            page_pool_overflow: page_pool.overflow,
+            page_pool_bypass: page_pool.bypass,
+            page_pool_free_pages: page_pool.global_free_pages,
+            page_pool_peak_free_pages: page_pool.peak_free_pages,
+            page_pool_max_free_pages: page_pool.max_free_pages,
             commit_attempts: meta.commit_attempts,
             commit_success: meta.commit_success,
             commit_errors: meta.commit_errors,

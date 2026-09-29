@@ -887,6 +887,56 @@ impl ServiceController {
                     let _ = stream.write_all(msg.as_bytes());
                     let _ = stream.flush();
                 }
+                // metadb's process-wide `Page` buffer pool. A 4 KiB heap buffer is
+                // a jemalloc slab of its own, so every page alloc/free was an
+                // extent operation and every freed page a dirty extent to purge;
+                // the checkpoint thread spent 22.4 % of its CPU in the allocator.
+                // `off` puts every page back on a fresh heap buffer — the baseline
+                // arm; the self-proof is `fresh`/`takes` on `metadb_page_pool`.
+                // `metadb-page-pool cap <bytes>` resizes the global stack's cap
+                // live, so a cap sweep needs no restart; it echoes the cap.
+                "metadb-page-pool" if parts.get(1) == Some(&"cap") => {
+                    let Some(bytes) = parts.get(2).and_then(|v| v.parse::<usize>().ok()) else {
+                        let _ = stream.write_all(b"error: usage: metadb-page-pool cap <bytes>\n");
+                        let _ = stream.flush();
+                        continue;
+                    };
+                    onyx_metadb::set_page_pool_max_free_bytes(bytes);
+                    let cap = onyx_metadb::page_pool_stats().max_free_pages * 4096;
+                    tracing::info!(cap_bytes = cap, "metadb page buffer pool cap set");
+                    let _ = stream.write_all(format!("{cap}\nok\n").as_bytes());
+                    let _ = stream.flush();
+                }
+                "metadb-page-pool" => {
+                    if let Some(arg) = parts.get(1) {
+                        match *arg {
+                            "on" | "true" | "1" => {
+                                onyx_metadb::set_page_pool_enabled(true);
+                                tracing::info!("metadb page buffer pool enabled");
+                            }
+                            "off" | "false" | "0" => {
+                                onyx_metadb::set_page_pool_enabled(false);
+                                tracing::info!("metadb page buffer pool disabled (heap pages)");
+                            }
+                            _ => {
+                                let _ = stream
+                                    .write_all(b"error: usage: metadb-page-pool [on|off]\n");
+                                let _ = stream.flush();
+                                continue;
+                            }
+                        }
+                    }
+                    let msg = format!(
+                        "{}\nok\n",
+                        if onyx_metadb::page_pool_enabled() {
+                            "on"
+                        } else {
+                            "off"
+                        }
+                    );
+                    let _ = stream.write_all(msg.as_bytes());
+                    let _ = stream.flush();
+                }
                 // Read or set the LV3 write-bundle width (design D1,
                 // `flush.stripe_run_max_stripes`): how many consecutive exactly-full
                 // stripe groups share one contiguous extent and therefore one write

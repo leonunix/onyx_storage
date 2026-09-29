@@ -167,6 +167,19 @@ enum Command {
         /// `on` / `off`; omit to just read the current state.
         state: Option<String>,
     },
+    /// Read or flip metadb's process-wide `Page` buffer pool.
+    ///
+    /// `off` puts every metadb page back on a fresh 4 KiB heap buffer — the
+    /// baseline arm. The self-proof is `fresh`/`takes` on the
+    /// `metadb_page_pool` status line; the judge is madvise/s and the
+    /// `/proc/interrupts` TLB row, not throughput.
+    MetadbPagePool {
+        /// `on` / `off`, or `cap` followed by a byte count; omit to just read
+        /// the current state.
+        state: Option<String>,
+        /// The byte count after `cap`.
+        value: Option<String>,
+    },
     /// Read or flip the running engine's LV2 commit-log sync slab arena.
     ///
     /// Separate from `mem-arena` on purpose: one switch for both consumers
@@ -1332,6 +1345,24 @@ fn main() -> anyhow::Result<()> {
             let cmd = match state {
                 Some(s) => format!("metadb-ckpt-pool {s}"),
                 None => "metadb-ckpt-pool".to_string(),
+            };
+            for line in service::send_chunklet_command(sock, &cmd)? {
+                println!("{line}");
+            }
+        }
+        Command::MetadbPagePool { state, value } => {
+            let sock = &config.service.socket_path;
+            if !sock.exists() {
+                anyhow::bail!(
+                    "metadb-page-pool talks to a running engine (socket {:?} not found) — \
+                     start it first",
+                    sock
+                );
+            }
+            let cmd = match (state, value) {
+                (Some(s), Some(v)) => format!("metadb-page-pool {s} {v}"),
+                (Some(s), None) => format!("metadb-page-pool {s}"),
+                (None, _) => "metadb-page-pool".to_string(),
             };
             for line in service::send_chunklet_command(sock, &cmd)? {
                 println!("{line}");

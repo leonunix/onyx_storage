@@ -84,6 +84,18 @@ pub struct MetaMemorySnapshot {
     pub cache_capacity_bytes: u64,
     pub cache_pinned_pages: u64,
     pub cache_pin_budget_bytes: u64,
+    /// metadb's process-wide `Page` buffer pool. Counters are cumulative;
+    /// `page_pool_fresh / page_pool_takes` is the miss rate and the arm's
+    /// self-proof (on: ~0 in steady state; off: takes stop, `bypass` counts).
+    pub page_pool_enabled: bool,
+    pub page_pool_takes: u64,
+    pub page_pool_fresh: u64,
+    pub page_pool_releases: u64,
+    pub page_pool_overflow: u64,
+    pub page_pool_bypass: u64,
+    pub page_pool_free_pages: u64,
+    pub page_pool_peak_free_pages: u64,
+    pub page_pool_max_free_pages: u64,
     pub commit_attempts: u64,
     pub commit_success: u64,
     pub commit_errors: u64,

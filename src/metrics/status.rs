@@ -584,6 +584,19 @@ impl EngineStatusSnapshot {
             );
             let _ = writeln!(
                 out,
+                "metadb_page_pool: enabled={} takes={} fresh={} releases={} overflow={} bypass={} free_pages={}/{} peak_free_pages={}",
+                u8::from(metadb.page_pool_enabled),
+                metadb.page_pool_takes,
+                metadb.page_pool_fresh,
+                metadb.page_pool_releases,
+                metadb.page_pool_overflow,
+                metadb.page_pool_bypass,
+                metadb.page_pool_free_pages,
+                metadb.page_pool_max_free_pages,
+                metadb.page_pool_peak_free_pages
+            );
+            let _ = writeln!(
+                out,
                 "metadb_pending: dispatch={} deferred_free={} dedup_lane_q={} l2p_apply_q={} l2p_priv={} l2p_retired={} l2p_buf_total={} l2p_buf_dirty={} rc_apply_q={} rc_priv={} rc_retired={} rc_buf_total={} rc_buf_dirty={}",
                 metadb.pending_dispatch,
                 metadb.pending_deferred_free,
